@@ -104,12 +104,13 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v5.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v6.html";
 const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://voice-mcp/player.html",
   "ui://cattea-voice/player-v2.html",
   "ui://cattea-voice/player-v3.html",
   "ui://cattea-voice/player-v4.html",
+  "ui://cattea-voice/player-v5.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
@@ -247,11 +248,10 @@ function getPlayerHTML(botName: string): string {
   <script>
     const contentEl = document.getElementById('content');
     const BOT_NAME = '${botName}';
-    let audio = null;
-    let audioObjectUrl = null;
     let waveInterval = null;
     let lastRenderedAudioUrl = '';
     let lastRenderedUsesEmbeddedAudio = false;
+    let stopActivePlayback = null;
     
     function escapeHtml(text) {
       const div = document.createElement('div');
@@ -275,10 +275,7 @@ function getPlayerHTML(botName: string): string {
     }
     
     function renderPlayer(text, audioUrl, audioBase64, audioRequest) {
-      if (audioObjectUrl) {
-        URL.revokeObjectURL(audioObjectUrl);
-        audioObjectUrl = null;
-      }
+      if (stopActivePlayback) stopActivePlayback();
       lastRenderedAudioUrl = audioUrl || '';
       lastRenderedUsesEmbeddedAudio = Boolean(audioBase64);
       contentEl.innerHTML = 
@@ -292,10 +289,8 @@ function getPlayerHTML(botName: string): string {
         '<button class="toggle-btn" id="toggleBtn">' +
           '<span class="arrow">▶</span> Show transcript' +
         '</button>' +
-        '<div class="text-bubble" id="textBubble">' + escapeHtml(text) + '</div>' +
-        '<audio id="audio" preload="metadata"></audio>';
+        '<div class="text-bubble" id="textBubble">' + escapeHtml(text) + '</div>';
       
-      audio = document.getElementById('audio');
       const playBtn = document.getElementById('playBtn');
       const playIcon = document.getElementById('playIcon');
       const durationEl = document.getElementById('duration');
@@ -304,19 +299,33 @@ function getPlayerHTML(botName: string): string {
       const toggleBtn = document.getElementById('toggleBtn');
       const textBubble = document.getElementById('textBubble');
 
-      function base64ToBlob(value) {
+      function base64ToArrayBuffer(value) {
         const binary = atob(value);
         const bytes = new Uint8Array(binary.length);
         for (let index = 0; index < binary.length; index++) {
           bytes[index] = binary.charCodeAt(index);
         }
-        return new Blob([bytes], { type: 'audio/mpeg' });
+        return bytes.buffer;
       }
 
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      let audioContext = null;
+      let decodedAudio = null;
+      let sourceNode = null;
+      let playbackOffset = 0;
+      let playbackStartedAt = 0;
+      let progressInterval = null;
+
+      if (!AudioContextClass) {
+        showError('Voice playback failed: Web Audio is unavailable.');
+        return;
+      }
+      audioContext = new AudioContextClass();
+
       async function prepareAudio() {
-        let blob;
+        let audioBytes;
         if (audioBase64) {
-          blob = base64ToBlob(audioBase64);
+          audioBytes = base64ToArrayBuffer(audioBase64);
         } else {
           const requestOptions = audioRequest ? {
             method: 'POST',
@@ -325,21 +334,74 @@ function getPlayerHTML(botName: string): string {
           } : undefined;
           const response = await fetch(audioUrl, requestOptions);
           if (!response.ok) throw new Error('Audio request failed (' + response.status + ').');
-          blob = await response.blob();
+          audioBytes = await response.arrayBuffer();
         }
-        if (!blob.size) throw new Error('The generated audio is empty.');
-        audioObjectUrl = URL.createObjectURL(blob);
-        audio.src = audioObjectUrl;
-        audio.load();
+        if (!audioBytes.byteLength) throw new Error('The generated audio is empty.');
+        decodedAudio = await audioContext.decodeAudioData(audioBytes.slice(0));
+        if (!decodedAudio.duration) throw new Error('The generated audio could not be decoded.');
+        durationEl.textContent = formatTime(decodedAudio.duration);
       }
 
-      function updateDuration() {
-        if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
-        durationEl.textContent = formatTime(audio.duration);
+      function setPlaying(playing) {
+        playBtn.classList.toggle('playing', playing);
+        playIcon.setAttribute('d', playing ? 'M6 19h4V5H6v14zm8-14v14h4V5h-4z' : 'M8 5v14l11-7z');
+        animateWave(bars, playing);
       }
 
-      audio.addEventListener('loadedmetadata', updateDuration);
-      audio.addEventListener('durationchange', updateDuration);
+      function updateProgress() {
+        if (!decodedAudio) return;
+        const elapsed = sourceNode ? audioContext.currentTime - playbackStartedAt : 0;
+        const currentTime = Math.min(playbackOffset + elapsed, decodedAudio.duration);
+        const activeCount = Math.floor((currentTime / decodedAudio.duration) * bars.length);
+        bars.forEach((bar, index) => bar.classList.toggle('active', index < activeCount));
+      }
+
+      function stopProgress() {
+        if (progressInterval) clearInterval(progressInterval);
+        progressInterval = null;
+      }
+
+      function stopSource() {
+        if (!sourceNode) return;
+        const node = sourceNode;
+        sourceNode = null;
+        node.onended = null;
+        try { node.stop(); } catch (_error) {}
+      }
+
+      function pausePlayback() {
+        playbackOffset = Math.min(
+          playbackOffset + audioContext.currentTime - playbackStartedAt,
+          decodedAudio?.duration || 0
+        );
+        stopSource();
+        stopProgress();
+        updateProgress();
+        setPlaying(false);
+      }
+
+      async function startPlayback() {
+        await audioReady;
+        if (audioLoadError) throw audioLoadError;
+        if (audioContext.state === 'suspended') await audioContext.resume();
+        if (playbackOffset >= decodedAudio.duration) playbackOffset = 0;
+        const node = audioContext.createBufferSource();
+        node.buffer = decodedAudio;
+        node.connect(audioContext.destination);
+        sourceNode = node;
+        playbackStartedAt = audioContext.currentTime;
+        node.onended = function() {
+          if (sourceNode !== node) return;
+          sourceNode = null;
+          playbackOffset = 0;
+          stopProgress();
+          bars.forEach(bar => bar.classList.remove('active'));
+          setPlaying(false);
+        };
+        node.start(0, playbackOffset);
+        progressInterval = setInterval(updateProgress, 100);
+        setPlaying(true);
+      }
       
       let audioLoadError = null;
       const audioReady = prepareAudio().catch(function(error) {
@@ -349,43 +411,23 @@ function getPlayerHTML(botName: string): string {
       });
 
       playBtn.addEventListener('click', async function() {
-        if (audio.paused) {
+        if (sourceNode) {
+          pausePlayback();
+        } else {
           try {
-            await audioReady;
-            if (audioLoadError) throw audioLoadError;
-            await audio.play();
+            if (audioContext.state === 'suspended') await audioContext.resume();
+            await startPlayback();
           } catch (error) {
             showError('Voice playback failed: ' + (error instanceof Error ? error.message : String(error)));
           }
-        } else {
-          audio.pause();
         }
       });
-      
-      audio.addEventListener('play', function() {
-        playBtn.classList.add('playing');
-        playIcon.setAttribute('d', 'M6 19h4V5H6v14zm8-14v14h4V5h-4z');
-        animateWave(bars, true);
-      });
-      
-      audio.addEventListener('pause', function() {
-        playBtn.classList.remove('playing');
-        playIcon.setAttribute('d', 'M8 5v14l11-7z');
-        animateWave(bars, false);
-      });
-      
-      audio.addEventListener('ended', function() {
-        playBtn.classList.remove('playing');
-        playIcon.setAttribute('d', 'M8 5v14l11-7z');
-        animateWave(bars, false);
-        bars.forEach(b => b.classList.remove('active'));
-      });
-      
-      audio.addEventListener('timeupdate', function() {
-        const progress = audio.currentTime / audio.duration;
-        const activeCount = Math.floor(progress * bars.length);
-        bars.forEach((b, i) => b.classList.toggle('active', i < activeCount));
-      });
+
+      stopActivePlayback = function() {
+        stopSource();
+        stopProgress();
+        if (audioContext && audioContext.state !== 'closed') audioContext.close().catch(function() {});
+      };
 
       toggleBtn.addEventListener('click', function() {
         const isShow = textBubble.classList.toggle('show');
