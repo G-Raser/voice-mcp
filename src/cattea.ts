@@ -4,7 +4,7 @@ const DEFAULT_BOT_NAME = "CatTea";
 const RECENT_INDEX_PATH = "/__cattea/recent-index";
 const RECENT_EVENT_PREFIX = "/__cattea/recent-event/";
 const RECENT_LIMIT = 12;
-const RECENT_API_VERSION = "v13";
+const RECENT_API_VERSION = "v14";
 
 type VoiceEvent = {
   id: string;
@@ -33,6 +33,12 @@ type ElevenLabsHistoryItem = {
   text?: string | null;
 };
 
+type HistoryFetchResult = {
+  events: RecentVoiceMeta[];
+  ok: boolean;
+  detail?: string;
+};
+
 type McpRequestInfo = {
   method?: string;
   toolName?: string;
@@ -51,6 +57,15 @@ async function readRecentIndex(origin: string): Promise<RecentVoiceMeta[]> {
   } catch (_error) {
     return [];
   }
+}
+
+async function writeRecentIndex(origin: string, events: RecentVoiceMeta[]): Promise<void> {
+  await caches.default.put(
+    cacheRequest(origin, RECENT_INDEX_PATH),
+    Response.json(events.slice(0, RECENT_LIMIT), {
+      headers: { "Cache-Control": "public, max-age=86400" },
+    }),
+  );
 }
 
 async function appendRecentEvent(origin: string, event: VoiceEvent): Promise<void> {
@@ -72,10 +87,7 @@ async function appendRecentEvent(origin: string, event: VoiceEvent): Promise<voi
   };
   const next = [meta, ...current.filter((item) => item.id !== meta.id)].slice(0, RECENT_LIMIT);
 
-  await caches.default.put(
-    cacheRequest(origin, RECENT_INDEX_PATH),
-    Response.json(next, { headers: { "Cache-Control": "public, max-age=86400" } }),
-  );
+  await writeRecentIndex(origin, next);
 }
 
 async function captureLatestVoiceEvent(origin: string, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -105,8 +117,10 @@ function isValidHistoryItemId(value: string): boolean {
   return /^[A-Za-z0-9_-]{8,128}$/.test(value);
 }
 
-async function fetchRecentElevenLabsVoices(env: Env): Promise<RecentVoiceMeta[]> {
-  if (!env.ELEVENLABS_API_KEY) return [];
+async function fetchRecentElevenLabsVoices(env: Env): Promise<HistoryFetchResult> {
+  if (!env.ELEVENLABS_API_KEY) {
+    return { events: [], ok: false, detail: "ElevenLabs API key is unavailable" };
+  }
 
   try {
     const historyUrl = new URL("https://api.elevenlabs.io/v1/history");
@@ -118,8 +132,9 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<RecentVoiceMeta[]>
       },
     });
     if (!response.ok) {
+      const detail = `ElevenLabs history returned ${response.status}`;
       console.error("Failed to load recent ElevenLabs voices", response.status, await response.text());
-      return [];
+      return { events: [], ok: false, detail };
     }
 
     const data = await response.json() as { history?: ElevenLabsHistoryItem[] };
@@ -129,7 +144,7 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<RecentVoiceMeta[]>
       ? history.filter((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id))
       : history;
 
-    return matchingHistory
+    const events = matchingHistory
       .filter((item): item is ElevenLabsHistoryItem & { history_item_id: string } => (
         typeof item.history_item_id === "string" && isValidHistoryItemId(item.history_item_id)
       ))
@@ -143,9 +158,14 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<RecentVoiceMeta[]>
         model_id: item.model_id || "eleven_v3",
         history_item_id: item.history_item_id,
       }));
+    return { events, ok: true };
   } catch (error) {
     console.error("Failed to load recent ElevenLabs voices", error);
-    return [];
+    return {
+      events: [],
+      ok: false,
+      detail: error instanceof Error ? error.message : "ElevenLabs history request failed",
+    };
   }
 }
 
@@ -295,6 +315,26 @@ function recentPanelAddon(): string {
     font-weight: 720;
     letter-spacing: 0.02em;
   }
+  .cattea-history-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .cattea-history-sync {
+    min-height: 30px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    padding: 0 11px;
+    font-size: 0.76rem;
+    cursor: pointer;
+  }
+  .cattea-history-sync:hover, .cattea-history-sync:focus-visible {
+    color: var(--ice);
+    outline: none;
+  }
+  .cattea-history-sync:disabled { cursor: wait; opacity: 0.58; }
   .cattea-history-close {
     width: 30px;
     height: 30px;
@@ -404,7 +444,10 @@ function recentPanelAddon(): string {
     <section class="cattea-history-modal" role="dialog" aria-modal="true" aria-labelledby="catteaHistoryTitle">
       <div class="cattea-history-head">
         <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices</div>
-        <button class="cattea-history-close" id="catteaHistoryClose" type="button" aria-label="Close history">×</button>
+        <div class="cattea-history-actions">
+          <button class="cattea-history-sync" id="catteaHistorySync" type="button">Sync</button>
+          <button class="cattea-history-close" id="catteaHistoryClose" type="button" aria-label="Close history">×</button>
+        </div>
       </div>
       <div class="cattea-history-error" id="catteaHistoryError" role="status" hidden></div>
       <div class="cattea-history-list" id="catteaHistoryList"></div>
@@ -415,6 +458,7 @@ function recentPanelAddon(): string {
 
   const modal = backdrop.querySelector('.cattea-history-modal');
   const closeButton = document.getElementById('catteaHistoryClose');
+  const syncButton = document.getElementById('catteaHistorySync');
   const list = document.getElementById('catteaHistoryList');
   const historyError = document.getElementById('catteaHistoryError');
   const historyAudio = document.getElementById('catteaHistoryAudio');
@@ -465,6 +509,45 @@ function recentPanelAddon(): string {
     }
   }
 
+  function renderRecentVoices(events) {
+    list.replaceChildren();
+    if (!events.length) {
+      const empty = document.createElement('div');
+      empty.className = 'cattea-history-empty';
+      empty.textContent = 'No recent voices yet';
+      list.appendChild(empty);
+      return;
+    }
+
+    events.forEach((item) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'cattea-history-item';
+
+      const play = document.createElement('span');
+      play.className = 'cattea-history-play';
+      play.textContent = '▶';
+
+      const copy = document.createElement('span');
+      copy.className = 'cattea-history-copy';
+      const title = document.createElement('strong');
+      title.textContent = item.text || 'Voice clip';
+      const meta = document.createElement('span');
+      meta.textContent = [formatRecentTime(item.created_at), item.model_id || ''].filter(Boolean).join(' · ');
+      copy.append(title, meta);
+      button.append(play, copy);
+      button.addEventListener('click', () => {
+        if (activeButton === button && !historyAudio.paused) {
+          historyAudio.pause();
+          setActiveButton(button, false);
+          return;
+        }
+        playRecentVoice(item.id, button);
+      });
+      list.appendChild(button);
+    });
+  }
+
   async function loadRecentVoices() {
     setHistoryError('');
     list.replaceChildren();
@@ -477,48 +560,37 @@ function recentPanelAddon(): string {
       const response = await fetch('/events/recent?history_version=${RECENT_API_VERSION}&_=' + Date.now(), { cache: 'no-store' });
       const data = await response.json();
       const events = Array.isArray(data.events) ? data.events : [];
-      list.replaceChildren();
-      if (!events.length) {
-        const empty = document.createElement('div');
-        empty.className = 'cattea-history-empty';
-        empty.textContent = 'No recent voices yet';
-        list.appendChild(empty);
-        return;
-      }
-
-      events.forEach((item) => {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'cattea-history-item';
-
-        const play = document.createElement('span');
-        play.className = 'cattea-history-play';
-        play.textContent = '▶';
-
-        const copy = document.createElement('span');
-        copy.className = 'cattea-history-copy';
-        const title = document.createElement('strong');
-        title.textContent = item.text || 'Voice clip';
-        const meta = document.createElement('span');
-        meta.textContent = [formatRecentTime(item.created_at), item.model_id || ''].filter(Boolean).join(' · ');
-        copy.append(title, meta);
-        button.append(play, copy);
-        button.addEventListener('click', () => {
-          if (activeButton === button && !historyAudio.paused) {
-            historyAudio.pause();
-            setActiveButton(button, false);
-            return;
-          }
-          playRecentVoice(item.id, button);
-        });
-        list.appendChild(button);
-      });
+      renderRecentVoices(events);
     } catch (_error) {
       list.replaceChildren();
       const failed = document.createElement('div');
       failed.className = 'cattea-history-empty';
       failed.textContent = 'History unavailable';
       list.appendChild(failed);
+    }
+  }
+
+  async function syncRecentVoices() {
+    const previousLabel = syncButton.textContent;
+    syncButton.disabled = true;
+    syncButton.textContent = 'Syncing…';
+    setHistoryError('');
+    try {
+      const response = await fetch('/events/recent/sync?history_version=${RECENT_API_VERSION}&_=' + Date.now(), {
+        method: 'POST',
+        cache: 'no-store',
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'History sync failed');
+      const events = Array.isArray(data.events) ? data.events : [];
+      renderRecentVoices(events);
+      syncButton.textContent = 'Synced ' + events.length;
+      setTimeout(() => { syncButton.textContent = previousLabel; }, 1800);
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : String(error));
+      syncButton.textContent = 'Retry';
+    } finally {
+      syncButton.disabled = false;
     }
   }
 
@@ -530,6 +602,7 @@ function recentPanelAddon(): string {
   });
 
   closeButton.addEventListener('click', closeHistory);
+  syncButton.addEventListener('click', syncRecentVoices);
   modal.addEventListener('click', (event) => event.stopPropagation());
   backdrop.addEventListener('click', closeHistory);
   historyAudio.addEventListener('ended', () => {
@@ -567,11 +640,20 @@ async function handleRecentEvents(
   const url = new URL(request.url);
   const id = url.searchParams.get("id")?.trim();
   if (!id) {
-    const [cached, history] = await Promise.all([
+    const [cached, historyResult] = await Promise.all([
       readRecentIndex(origin),
       fetchRecentElevenLabsVoices(env),
     ]);
-    return Response.json({ events: mergeRecentVoices(cached, history) }, {
+    return Response.json({
+      events: mergeRecentVoices(cached, historyResult.events),
+      sync: {
+        ok: historyResult.ok,
+        history_count: historyResult.events.length,
+        detail: historyResult.detail,
+        colo: request.cf?.colo,
+        version: RECENT_API_VERSION,
+      },
+    }, {
       headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
     });
   }
@@ -597,6 +679,34 @@ async function handleRecentEvents(
   }
   const event = await response.json<VoiceEvent>();
   return Response.json({ event }, {
+    headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+async function handleRecentSync(request: Request, origin: string, env: Env): Promise<Response> {
+  const historyResult = await fetchRecentElevenLabsVoices(env);
+  const cached = await readRecentIndex(origin);
+  const events = mergeRecentVoices(cached, historyResult.events);
+  const colo = request.cf?.colo || "unknown";
+
+  if (!historyResult.ok) {
+    return Response.json({
+      error: `Sync failed at Cloudflare ${colo}: ${historyResult.detail || "ElevenLabs history unavailable"}`,
+      events,
+      version: RECENT_API_VERSION,
+    }, {
+      status: 502,
+      headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  await writeRecentIndex(origin, events);
+  return Response.json({
+    events,
+    synced: historyResult.events.length,
+    colo,
+    version: RECENT_API_VERSION,
+  }, {
     headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
   });
 }
@@ -695,6 +805,9 @@ export default {
     if (path === "/events/recent" && request.method === "GET") {
       return handleRecentEvents(request, origin, env, ctx);
     }
+    if (path === "/events/recent/sync" && request.method === "POST") {
+      return handleRecentSync(request, origin, env);
+    }
     if (path === "/events/recent/audio" && request.method === "GET") {
       return handleRecentAudio(request, origin, env, ctx);
     }
@@ -706,7 +819,7 @@ export default {
     let response = await worker.fetch(request, env, ctx);
     const contentType = response.headers.get("Content-Type") || "";
 
-    if ((path === "/panel" || path === "/panel-v13") && contentType.includes("text/html")) {
+    if ((path === "/panel" || path === "/panel-v13" || path === "/panel-v14") && contentType.includes("text/html")) {
       const personalizedHtml = personalizePanelHtml(await response.text());
       return new Response(personalizedHtml, {
         status: response.status,

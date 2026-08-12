@@ -42,7 +42,7 @@ export default {
     const path = new URL(request.url).pathname;
     const contentType = response.headers.get("Content-Type") || "";
 
-    if (path !== "/panel" || !contentType.includes("text/html")) {
+    if (!["/panel", "/panel-v13", "/panel-v14"].includes(path) || !contentType.includes("text/html")) {
       return response;
     }
 
