@@ -103,8 +103,9 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v2.html";
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
+const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
@@ -262,9 +263,7 @@ function getPlayerHTML(botName: string): string {
       return heights.map(h => '<div class="wave-bar" style="height:' + h + '%"></div>').join('');
     }
     
-    function renderPlayer(text, audioBase64) {
-      const audioUrl = 'data:audio/mpeg;base64,' + audioBase64;
-      
+    function renderPlayer(text, audioUrl) {
       contentEl.innerHTML = 
         '<div class="player">' +
           '<button class="play-btn" id="playBtn">' +
@@ -277,7 +276,7 @@ function getPlayerHTML(botName: string): string {
           '<span class="arrow">▶</span> Show transcript' +
         '</button>' +
         '<div class="text-bubble" id="textBubble">' + escapeHtml(text) + '</div>' +
-        '<audio id="audio" src="' + audioUrl + '" preload="metadata"></audio>';
+        '<audio id="audio" preload="metadata"></audio>';
       
       audio = document.getElementById('audio');
       const playBtn = document.getElementById('playBtn');
@@ -287,10 +286,14 @@ function getPlayerHTML(botName: string): string {
       const bars = waveform.querySelectorAll('.wave-bar');
       const toggleBtn = document.getElementById('toggleBtn');
       const textBubble = document.getElementById('textBubble');
-      
-      audio.addEventListener('loadedmetadata', function() {
+
+      function updateDuration() {
+        if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
         durationEl.textContent = formatTime(audio.duration);
-      });
+      }
+
+      audio.addEventListener('loadedmetadata', updateDuration);
+      audio.addEventListener('durationchange', updateDuration);
       
       playBtn.addEventListener('click', function() {
         if (audio.paused) {
@@ -324,6 +327,10 @@ function getPlayerHTML(botName: string): string {
         const activeCount = Math.floor(progress * bars.length);
         bars.forEach((b, i) => b.classList.toggle('active', i < activeCount));
       });
+
+      audio.src = audioUrl;
+      audio.load();
+      updateDuration();
       
       toggleBtn.addEventListener('click', function() {
         const isShow = textBubble.classList.toggle('show');
@@ -349,8 +356,8 @@ function getPlayerHTML(botName: string): string {
     
     function handleData(data) {
       if (data.error) { showError(data.error); return; }
-      if (data.audio_base64 && data.text) {
-        renderPlayer(data.text, data.audio_base64);
+      if (data.audio_url && data.text) {
+        renderPlayer(data.text, data.audio_url);
       }
     }
     
@@ -2813,6 +2820,12 @@ function getLatestVoiceCacheRequest(origin: string): Request {
   return new Request(new URL(LATEST_VOICE_CACHE_PATH, origin).toString(), { method: "GET" });
 }
 
+function getVoiceEventCacheRequest(origin: string, id: string): Request {
+  return new Request(new URL(VOICE_EVENT_CACHE_PREFIX + encodeURIComponent(id), origin).toString(), {
+    method: "GET",
+  });
+}
+
 function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): VoiceEvent {
   const provider = getTtsProvider(env);
   const finalText = result.final_text || input.text;
@@ -2833,20 +2846,69 @@ function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): Voi
 }
 
 async function storeLatestVoiceEvent(origin: string, event: VoiceEvent): Promise<void> {
-  await caches.default.put(
-    getLatestVoiceCacheRequest(origin),
-    Response.json(event, {
-      headers: {
-        "Cache-Control": "public, max-age=3600",
-      },
-    }),
-  );
+  await Promise.all([
+    caches.default.put(
+      getLatestVoiceCacheRequest(origin),
+      Response.json(event, {
+        headers: { "Cache-Control": "public, max-age=3600" },
+      }),
+    ),
+    caches.default.put(
+      getVoiceEventCacheRequest(origin, event.id),
+      Response.json(event, {
+        headers: { "Cache-Control": "public, max-age=86400" },
+      }),
+    ),
+  ]);
 }
 
 async function readLatestVoiceEvent(origin: string): Promise<VoiceEvent | null> {
   const response = await caches.default.match(getLatestVoiceCacheRequest(origin));
   if (!response) return null;
   return await response.json<VoiceEvent>();
+}
+
+async function readVoiceEvent(origin: string, id: string): Promise<VoiceEvent | null> {
+  const response = await caches.default.match(getVoiceEventCacheRequest(origin, id));
+  if (!response) return null;
+  return await response.json<VoiceEvent>();
+}
+
+function createAudioResponse(request: Request, audioBase64: string): Response {
+  const binary = atob(audioBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+
+  const headers = new Headers({
+    ...corsHeaders,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "public, max-age=86400, immutable",
+    "Content-Type": "audio/mpeg",
+  });
+  const range = request.headers.get("Range");
+  if (!range) {
+    headers.set("Content-Length", String(bytes.length));
+    return new Response(request.method === "HEAD" ? null : bytes, { headers });
+  }
+
+  const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+  if (!match) {
+    headers.set("Content-Range", `bytes */${bytes.length}`);
+    return new Response(null, { status: 416, headers });
+  }
+
+  const start = Number(match[1]);
+  const requestedEnd = match[2] ? Number(match[2]) : bytes.length - 1;
+  const end = Math.min(requestedEnd, bytes.length - 1);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= bytes.length) {
+    headers.set("Content-Range", `bytes */${bytes.length}`);
+    return new Response(null, { status: 416, headers });
+  }
+
+  const chunk = bytes.slice(start, end + 1);
+  headers.set("Content-Length", String(chunk.length));
+  headers.set("Content-Range", `bytes ${start}-${end}/${bytes.length}`);
+  return new Response(request.method === "HEAD" ? null : chunk, { status: 206, headers });
 }
 
 // =============================================================================
@@ -2879,6 +2941,22 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           uri: VOICE_RESOURCE_URI,
           mimeType: EXT_APPS_MIME,
           text: PLAYER_HTML,
+          _meta: {
+            ui: {
+              prefersBorder: true,
+              domain: origin,
+              csp: {
+                connectDomains: [origin],
+                resourceDomains: [origin],
+              },
+            },
+            "openai/widgetPrefersBorder": true,
+            "openai/widgetDomain": origin,
+            "openai/widgetCSP": {
+              connect_domains: [origin],
+              resource_domains: [origin],
+            },
+          },
         },
       ],
     }),
@@ -2897,6 +2975,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
       _meta: {
         ui: { resourceUri: VOICE_RESOURCE_URI },
         "ui/resourceUri": VOICE_RESOURCE_URI,
+        "openai/outputTemplate": VOICE_RESOURCE_URI,
       },
     },
     async ({ text, style, raw_tags }) => {
@@ -2916,8 +2995,9 @@ function createVoiceServer(env: Env, origin: string): McpServer {
       const result = await generateAudio(env, input);
 
       if (result.success && result.audio_base64) {
+        const event = createVoiceEvent(env, input, result);
         try {
-          await storeLatestVoiceEvent(origin, createVoiceEvent(env, input, result));
+          await storeLatestVoiceEvent(origin, event);
         } catch (error) {
           console.error("Failed to store latest voice event", error);
         }
@@ -2928,6 +3008,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           ],
           structuredContent: {
             text: text,
+            audio_url: new URL(`/audio/${event.id}.mp3`, origin).toString(),
             audio_base64: result.audio_base64,
           },
         };
@@ -3004,6 +3085,21 @@ export default {
           "Cache-Control": "no-store",
         },
       });
+    }
+
+    const audioPathMatch = /^\/audio\/([0-9a-f-]+)\.mp3$/i.exec(path);
+    if (audioPathMatch && (request.method === 'GET' || request.method === 'HEAD')) {
+      const event = await readVoiceEvent(url.origin, audioPathMatch[1]);
+      if (!event?.audio_base64) {
+        return Response.json({ error: 'Voice clip not found' }, {
+          status: 404,
+          headers: {
+            ...corsHeaders,
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      return createAudioResponse(request, event.audio_base64);
     }
 
     if (path === '/history' && request.method === 'GET') {
