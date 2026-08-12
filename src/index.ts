@@ -1555,8 +1555,28 @@ function getVisualizerPanelHTML(botName: string): string {
       opacity: 0.66;
     }
     .history-add {
-      border-color: color-mix(in oklch, var(--green), var(--line) 58%);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-color: var(--line);
+      color: var(--muted);
+      padding-inline: 12px;
+      font-weight: 660;
+    }
+    .history-add svg {
+      width: 14px;
+      height: 14px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .history-add:hover, .history-add:focus-visible {
+      border-color: color-mix(in oklch, var(--green), var(--line) 54%);
       color: var(--green);
+      outline: none;
     }
     label {
       color: var(--muted);
@@ -1730,7 +1750,8 @@ function getVisualizerPanelHTML(botName: string): string {
       .status { justify-items: start; text-align: left; }
       .receiver { align-items: flex-start; }
       .receiver-actions { gap: var(--space-sm); }
-      .history-row { grid-template-columns: 1fr; }
+      .history-row { grid-template-columns: 1fr 1fr; }
+      .history-input { grid-column: 1 / -1; }
       .controls { grid-template-columns: 1fr; }
       .actions { justify-content: space-between; }
       .transport { grid-template-columns: 50px 1fr 42px; }
@@ -1784,7 +1805,13 @@ function getVisualizerPanelHTML(botName: string): string {
           <div class="history-row">
             <input class="history-input" id="historyId" name="history_id" autocomplete="off" spellcheck="false" placeholder="KBKoxwRtRx2Mi0NucpGV">
             <button class="history-load" id="historyLoadButton" type="submit">Load</button>
-            <button class="history-load history-add" id="historyAddButton" type="button">Add to History</button>
+            <button class="history-load history-add" id="historyAddButton" type="button" aria-label="Add this voice to History" title="Add to History">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 3h12v18l-6-4-6 4z"></path>
+                <path d="M12 7v6M9 10h6"></path>
+              </svg>
+              <span>Save</span>
+            </button>
           </div>
         </form>
 
