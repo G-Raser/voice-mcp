@@ -51,6 +51,7 @@ interface SpeakInput {
 interface AudioResult {
   success: boolean;
   audio_base64?: string;
+  history_item_id?: string;
   alignment?: ElevenLabsAlignment;
   normalized_alignment?: ElevenLabsAlignment;
   final_text?: string;
@@ -104,13 +105,14 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v6.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v7.html";
 const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://voice-mcp/player.html",
   "ui://cattea-voice/player-v2.html",
   "ui://cattea-voice/player-v3.html",
   "ui://cattea-voice/player-v4.html",
   "ui://cattea-voice/player-v5.html",
+  "ui://cattea-voice/player-v6.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const LATEST_HISTORY_SYNC_PATH = "/__voice-mcp/latest-history-sync";
@@ -464,6 +466,38 @@ function getPlayerHTML(botName: string): string {
       return '';
     }
 
+    const announcedEventIds = new Set();
+
+    function announceVoice(data, audioBase64) {
+      if (!audioBase64 || !data.event_id || announcedEventIds.has(data.event_id)) return;
+      announcedEventIds.add(data.event_id);
+      let announceUrl;
+      try {
+        announceUrl = new URL('/events/announce', data.audio_url).toString();
+      } catch (_error) {
+        return;
+      }
+      fetch(announceUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: data.event_id,
+          text: data.text,
+          audio_base64: audioBase64,
+          created_at: data.created_at,
+          provider: data.provider,
+          model_id: data.model_id,
+          history_item_id: data.history_item_id,
+          audio_url: data.audio_url,
+          audio_request: data.audio_request
+        })
+      }).then(function(response) {
+        if (!response.ok) announcedEventIds.delete(data.event_id);
+      }).catch(function() {
+        announcedEventIds.delete(data.event_id);
+      });
+    }
+
     function handleData(data, inheritedAudioBase64) {
       if (!data || typeof data !== 'object') return false;
       const audioBase64 = inheritedAudioBase64 || findAudioBase64(data, 0);
@@ -476,6 +510,7 @@ function getPlayerHTML(botName: string): string {
       }
       if (data.error) { showError(data.error); return true; }
       if (data.audio_url && data.text) {
+        announceVoice(data, audioBase64);
         if (data.audio_url !== lastRenderedAudioUrl || (audioBase64 && !lastRenderedUsesEmbeddedAudio)) {
           renderPlayer(data.text, data.audio_url, audioBase64, data.audio_request);
         }
@@ -2744,6 +2779,7 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
 
     const data = await response.json() as {
       audio_base64?: string;
+      history_item_id?: string;
       alignment?: ElevenLabsAlignment;
       normalized_alignment?: ElevenLabsAlignment;
     };
@@ -2755,6 +2791,10 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
     return {
       success: true,
       audio_base64: data.audio_base64,
+      history_item_id: data.history_item_id
+        || response.headers.get("history-item-id")
+        || response.headers.get("x-history-item-id")
+        || undefined,
       alignment: data.alignment,
       normalized_alignment: data.normalized_alignment,
       final_text: finalText,
@@ -3076,6 +3116,7 @@ function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): Voi
     created_at: new Date().toISOString(),
     provider,
     model_id: provider === "elevenlabs" ? getElevenLabsModel(env) : getDashScopeModel(env),
+    history_item_id: result.history_item_id,
     caption_cues: captionCues.length ? captionCues : undefined,
     style: input.style,
     raw_tags: input.raw_tags,
@@ -3117,8 +3158,7 @@ async function fetchLatestElevenLabsHistoryItem(env: Env): Promise<ElevenLabsHis
   if (!env.ELEVENLABS_API_KEY) return null;
 
   const historyUrl = new URL("https://api.elevenlabs.io/v1/history");
-  historyUrl.searchParams.set("page_size", "10");
-  historyUrl.searchParams.set("source", "TTS");
+  historyUrl.searchParams.set("page_size", "20");
   const response = await fetch(historyUrl.toString(), {
     headers: {
       "xi-api-key": env.ELEVENLABS_API_KEY,
@@ -3135,10 +3175,10 @@ async function fetchLatestElevenLabsHistoryItem(env: Env): Promise<ElevenLabsHis
   const history = Array.isArray(data.history) ? data.history : [];
   const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
 
-  return history.find((item) => {
-    if (!item.history_item_id || !isValidHistoryItemId(item.history_item_id)) return false;
-    return configuredVoiceIds.size === 0 || (typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id));
-  }) || null;
+  const validHistory = history.filter((item) => item.history_item_id && isValidHistoryItemId(item.history_item_id));
+  return validHistory.find((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id))
+    || validHistory[0]
+    || null;
 }
 
 async function syncLatestElevenLabsHistoryEvent(
@@ -3333,6 +3373,11 @@ function createVoiceServer(env: Env, origin: string): McpServer {
             text: text,
             audio_url: audioUrl,
             audio_request: input,
+            event_id: event.id,
+            created_at: event.created_at,
+            provider: event.provider,
+            model_id: event.model_id,
+            history_item_id: event.history_item_id,
           },
           _meta: { audio_base64: result.audio_base64 },
         };
@@ -3410,6 +3455,58 @@ export default {
           "Cache-Control": "no-store",
         },
       });
+    }
+
+    if (path === '/events/announce' && request.method === 'POST') {
+      try {
+        const body = await request.json() as Partial<VoiceEvent> & {
+          audio_url?: string;
+          audio_request?: Partial<SpeakInput>;
+        };
+        const replayUrl = new URL(body.audio_url || "");
+        const expires = Number(replayUrl.searchParams.get('expires'));
+        const signature = replayUrl.searchParams.get('signature') || '';
+        const input = normalizeSpeakInput({
+          text: typeof body.audio_request?.text === 'string' ? body.audio_request.text : '',
+          style: typeof body.audio_request?.style === 'string' ? body.audio_request.style : undefined,
+          raw_tags: typeof body.audio_request?.raw_tags === 'boolean' ? body.audio_request.raw_tags : undefined,
+        });
+        const expectedSignature = await signAudioReplay(env, expires, input);
+        const validEventId = typeof body.id === 'string' && /^[0-9a-f-]{36}$/i.test(body.id);
+        const validAudio = typeof body.audio_base64 === 'string'
+          && body.audio_base64.length > 0
+          && body.audio_base64.length <= 14_000_000;
+        if (
+          replayUrl.origin !== url.origin
+          || replayUrl.pathname !== AUDIO_REPLAY_PATH
+          || !Number.isSafeInteger(expires)
+          || expires < Math.floor(Date.now() / 1000)
+          || !signature
+          || !signaturesMatch(signature, expectedSignature)
+          || !validEventId
+          || !validAudio
+        ) {
+          throw new Error('Invalid voice announcement');
+        }
+        const event: VoiceEvent = {
+          id: body.id!,
+          text: typeof body.text === 'string' ? body.text : input.text,
+          audio_base64: body.audio_base64!,
+          created_at: typeof body.created_at === 'string' ? body.created_at : new Date().toISOString(),
+          provider: body.provider === 'dashscope' ? 'dashscope' : 'elevenlabs',
+          model_id: typeof body.model_id === 'string' ? body.model_id : getElevenLabsModel(env),
+          history_item_id: typeof body.history_item_id === 'string' ? body.history_item_id : undefined,
+        };
+        await storeLatestVoiceEvent(url.origin, event);
+        return Response.json({ ok: true, event_id: event.id }, {
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      } catch (error) {
+        return Response.json({ error: error instanceof Error ? error.message : 'Invalid voice announcement' }, {
+          status: 400,
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      }
     }
 
     if (path === AUDIO_REPLAY_PATH && request.method === 'POST') {

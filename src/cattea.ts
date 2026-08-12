@@ -498,6 +498,8 @@ export default {
 
     if (path === "/speak" && response.ok && contentType.includes("audio/")) {
       ctx.waitUntil(captureLatestVoiceEvent(origin, env, ctx));
+    } else if (path === "/events/announce" && request.method === "POST" && response.ok) {
+      ctx.waitUntil(captureLatestVoiceEvent(origin, env, ctx));
     } else if (mcpInfo.method === "tools/call" && mcpInfo.toolName === "speak" && response.ok) {
       try {
         const data = await response.clone().json<unknown>();
