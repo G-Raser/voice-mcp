@@ -9,5 +9,19 @@
   },
   "observability": {
     "enabled": true
-  }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VOICE_HISTORY",
+        "class_name": "VoiceHistoryStore"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v15-voice-history",
+      "new_sqlite_classes": ["VoiceHistoryStore"]
+    }
+  ]
 }

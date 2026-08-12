@@ -1,10 +1,11 @@
 import worker, { type Env } from "./index";
+import type { GlobalVoiceEvent, GlobalVoiceMeta } from "./voice-history-store";
 
 const DEFAULT_BOT_NAME = "CatTea";
 const RECENT_INDEX_PATH = "/__cattea/recent-index";
 const RECENT_EVENT_PREFIX = "/__cattea/recent-event/";
 const RECENT_LIMIT = 12;
-const RECENT_API_VERSION = "v14";
+const RECENT_API_VERSION = "v15";
 
 type VoiceEvent = {
   id: string;
@@ -43,6 +44,84 @@ type McpRequestInfo = {
   method?: string;
   toolName?: string;
 };
+
+type GlobalHistoryResult = {
+  events: RecentVoiceMeta[];
+  ok: boolean;
+  detail?: string;
+};
+
+function getGlobalHistoryStub(env: Env): DurableObjectStub | null {
+  if (!env.VOICE_HISTORY) return null;
+  const id = env.VOICE_HISTORY.idFromName("cattea-voice-history-v1");
+  return env.VOICE_HISTORY.get(id, { locationHint: "wnam" });
+}
+
+async function readGlobalRecentVoices(env: Env): Promise<GlobalHistoryResult> {
+  const stub = getGlobalHistoryStub(env);
+  if (!stub) return { events: [], ok: false, detail: "Global voice store is not configured" };
+  try {
+    const response = await stub.fetch("https://voice-history.internal/events");
+    const data = await response.json<{ events?: GlobalVoiceMeta[]; error?: string }>();
+    if (!response.ok) return { events: [], ok: false, detail: data.error || `Global store returned ${response.status}` };
+    return { events: Array.isArray(data.events) ? data.events : [], ok: true };
+  } catch (error) {
+    return { events: [], ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function storeGlobalVoiceEvent(env: Env, event: VoiceEvent): Promise<void> {
+  const stub = getGlobalHistoryStub(env);
+  if (!stub) return;
+  const globalEvent: GlobalVoiceEvent = event;
+  const response = await stub.fetch("https://voice-history.internal/event", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(globalEvent),
+  });
+  if (!response.ok) console.error("Failed to store global CatTea voice event", response.status, await response.text());
+}
+
+async function getGlobalVoiceEvent(env: Env, id: string): Promise<VoiceEvent | null> {
+  const stub = getGlobalHistoryStub(env);
+  if (!stub) return null;
+  const url = new URL("https://voice-history.internal/event");
+  url.searchParams.set("id", id);
+  const response = await stub.fetch(url);
+  if (!response.ok) return null;
+  const data = await response.json<{ event?: VoiceEvent }>();
+  return data.event?.audio_base64 ? data.event : null;
+}
+
+async function recoverGlobalHistoryEvent(env: Env, historyItemId: string): Promise<{ event?: VoiceEvent; error?: string }> {
+  const stub = getGlobalHistoryStub(env);
+  if (!stub) return { error: "Global voice store is not configured" };
+  try {
+    const url = new URL("https://voice-history.internal/recover");
+    url.searchParams.set("id", historyItemId);
+    const response = await stub.fetch(url);
+    const data = await response.json<{ event?: VoiceEvent; error?: string }>();
+    if (!response.ok || !data.event?.audio_base64) {
+      return { error: data.error || `Global recovery returned ${response.status}` };
+    }
+    return { event: data.event };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function syncGlobalRecentVoices(env: Env): Promise<GlobalHistoryResult> {
+  const stub = getGlobalHistoryStub(env);
+  if (!stub) return { events: [], ok: false, detail: "Global voice store is not configured" };
+  try {
+    const response = await stub.fetch("https://voice-history.internal/sync", { method: "POST" });
+    const data = await response.json<{ events?: GlobalVoiceMeta[]; error?: string }>();
+    if (!response.ok) return { events: [], ok: false, detail: data.error || `Global sync returned ${response.status}` };
+    return { events: Array.isArray(data.events) ? data.events : [], ok: true };
+  } catch (error) {
+    return { events: [], ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 function cacheRequest(origin: string, path: string): Request {
   return new Request(new URL(path, origin).toString(), { method: "GET" });
@@ -99,7 +178,12 @@ async function captureLatestVoiceEvent(origin: string, env: Env, ctx: ExecutionC
     );
     if (!response.ok) return;
     const data = await response.json<{ event?: VoiceEvent | null }>();
-    if (data.event) await appendRecentEvent(origin, data.event);
+    if (data.event) {
+      await Promise.all([
+        appendRecentEvent(origin, data.event),
+        storeGlobalVoiceEvent(env, data.event),
+      ]);
+    }
   } catch (error) {
     console.error("Failed to capture recent CatTea voice event", error);
   }
@@ -130,6 +214,7 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<HistoryFetchResult
         "xi-api-key": env.ELEVENLABS_API_KEY,
         "Accept": "application/json",
       },
+      signal: AbortSignal.timeout(12_000),
     });
     if (!response.ok) {
       const detail = `ElevenLabs history returned ${response.status}`;
@@ -443,7 +528,7 @@ function recentPanelAddon(): string {
   backdrop.innerHTML = ` + "`" + `
     <section class="cattea-history-modal" role="dialog" aria-modal="true" aria-labelledby="catteaHistoryTitle">
       <div class="cattea-history-head">
-        <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices</div>
+        <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices · global v15</div>
         <div class="cattea-history-actions">
           <button class="cattea-history-sync" id="catteaHistorySync" type="button">Sync</button>
           <button class="cattea-history-close" id="catteaHistoryClose" type="button" aria-label="Close history">×</button>
@@ -557,7 +642,10 @@ function recentPanelAddon(): string {
     list.appendChild(loading);
 
     try {
-      const response = await fetch('/events/recent?history_version=${RECENT_API_VERSION}&_=' + Date.now(), { cache: 'no-store' });
+      const response = await fetch('/events/recent?history_version=${RECENT_API_VERSION}&_=' + Date.now(), {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(12_000),
+      });
       const data = await response.json();
       const events = Array.isArray(data.events) ? data.events : [];
       renderRecentVoices(events);
@@ -579,6 +667,7 @@ function recentPanelAddon(): string {
       const response = await fetch('/events/recent/sync?history_version=${RECENT_API_VERSION}&_=' + Date.now(), {
         method: 'POST',
         cache: 'no-store',
+        signal: AbortSignal.timeout(20_000),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'History sync failed');
@@ -640,10 +729,11 @@ async function handleRecentEvents(
   const url = new URL(request.url);
   const id = url.searchParams.get("id")?.trim();
   if (!id) {
-    const [cached, historyResult] = await Promise.all([
+    const [cached, globalResult] = await Promise.all([
       readRecentIndex(origin),
-      fetchRecentElevenLabsVoices(env),
+      readGlobalRecentVoices(env),
     ]);
+    const historyResult = globalResult.ok ? globalResult : await fetchRecentElevenLabsVoices(env);
     return Response.json({
       events: mergeRecentVoices(cached, historyResult.events),
       sync: {
@@ -652,6 +742,7 @@ async function handleRecentEvents(
         detail: historyResult.detail,
         colo: request.cf?.colo,
         version: RECENT_API_VERSION,
+        source: globalResult.ok ? "global" : "regional-fallback",
       },
     }, {
       headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
@@ -684,14 +775,15 @@ async function handleRecentEvents(
 }
 
 async function handleRecentSync(request: Request, origin: string, env: Env): Promise<Response> {
-  const historyResult = await fetchRecentElevenLabsVoices(env);
+  const globalResult = await syncGlobalRecentVoices(env);
+  const historyResult = globalResult.ok ? globalResult : await fetchRecentElevenLabsVoices(env);
   const cached = await readRecentIndex(origin);
   const events = mergeRecentVoices(cached, historyResult.events);
   const colo = request.cf?.colo || "unknown";
 
   if (!historyResult.ok) {
     return Response.json({
-      error: `Sync failed at Cloudflare ${colo}: ${historyResult.detail || "ElevenLabs history unavailable"}`,
+      error: `Global sync failed: ${globalResult.detail || "unavailable"}; regional ${colo}: ${historyResult.detail || "ElevenLabs history unavailable"}`,
       events,
       version: RECENT_API_VERSION,
     }, {
@@ -705,6 +797,7 @@ async function handleRecentSync(request: Request, origin: string, env: Env): Pro
     events,
     synced: historyResult.events.length,
     colo,
+    source: globalResult.ok ? "global" : "regional-fallback",
     version: RECENT_API_VERSION,
   }, {
     headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
@@ -769,9 +862,16 @@ async function handleRecentAudio(
     if (event.audio_base64) return createRecentAudioResponse(request, event.audio_base64);
   }
 
+  const globalEvent = await getGlobalVoiceEvent(env, id);
+  if (globalEvent?.audio_base64) return createRecentAudioResponse(request, globalEvent.audio_base64);
+
   if (id.startsWith("elevenlabs-")) {
     const historyItemId = id.slice("elevenlabs-".length);
     if (isValidHistoryItemId(historyItemId)) {
+      const globalRecovery = await recoverGlobalHistoryEvent(env, historyItemId);
+      if (globalRecovery.event?.audio_base64) {
+        return createRecentAudioResponse(request, globalRecovery.event.audio_base64);
+      }
       const response = await worker.fetch(
         new Request(new URL(`/history?id=${encodeURIComponent(historyItemId)}&align=0`, origin).toString()),
         env,
@@ -812,6 +912,24 @@ export default {
       return handleRecentAudio(request, origin, env, ctx);
     }
 
+    if (path === "/history" && request.method === "GET" && url.searchParams.get("align") === "0") {
+      const historyItemId = url.searchParams.get("id")?.trim() || "";
+      if (historyItemId && isValidHistoryItemId(historyItemId)) {
+        const globalRecovery = await recoverGlobalHistoryEvent(env, historyItemId);
+        if (globalRecovery.event) {
+          return Response.json({ event: globalRecovery.event }, {
+            headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+          });
+        }
+        if (env.VOICE_HISTORY) {
+          return Response.json({ error: `Global recovery failed: ${globalRecovery.error || "unknown error"}` }, {
+            status: 502,
+            headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+          });
+        }
+      }
+    }
+
     const mcpInfo = path === "/mcp" || path === "/mcp/" || path === "/sse"
       ? await readMcpRequestInfo(request)
       : {};
@@ -819,7 +937,7 @@ export default {
     let response = await worker.fetch(request, env, ctx);
     const contentType = response.headers.get("Content-Type") || "";
 
-    if ((path === "/panel" || path === "/panel-v13" || path === "/panel-v14") && contentType.includes("text/html")) {
+    if ((path === "/panel" || path === "/panel-v13" || path === "/panel-v14" || path === "/panel-v15") && contentType.includes("text/html")) {
       const personalizedHtml = personalizePanelHtml(await response.text());
       return new Response(personalizedHtml, {
         status: response.status,
@@ -840,6 +958,11 @@ export default {
       try {
         const data = await response.clone().json<unknown>();
         if (hasAudioPayload(data)) ctx.waitUntil(captureLatestVoiceEvent(origin, env, ctx));
+      } catch (_error) {}
+    } else if (path === "/history" && request.method === "GET" && response.ok) {
+      try {
+        const data = await response.clone().json<{ event?: VoiceEvent }>();
+        if (data.event?.audio_base64) ctx.waitUntil(storeGlobalVoiceEvent(env, data.event));
       } catch (_error) {}
     }
 

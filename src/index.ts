@@ -37,6 +37,7 @@ export interface Env {
   ELEVENLABS_SPEED?: string;
   AUDIO_URL_SIGNING_KEY?: string;
   BOT_NAME?: string;
+  VOICE_HISTORY?: DurableObjectNamespace;
 }
 
 type TtsProvider = "dashscope" | "elevenlabs";
@@ -1521,7 +1522,7 @@ function getVisualizerPanelHTML(botName: string): string {
     }
     .history-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       gap: var(--space-sm);
       align-items: center;
     }
@@ -1552,6 +1553,10 @@ function getVisualizerPanelHTML(botName: string): string {
     .history-load:disabled {
       cursor: wait;
       opacity: 0.66;
+    }
+    .history-add {
+      border-color: color-mix(in oklch, var(--green), var(--line) 58%);
+      color: var(--green);
     }
     label {
       color: var(--muted);
@@ -1779,6 +1784,7 @@ function getVisualizerPanelHTML(botName: string): string {
           <div class="history-row">
             <input class="history-input" id="historyId" name="history_id" autocomplete="off" spellcheck="false" placeholder="KBKoxwRtRx2Mi0NucpGV">
             <button class="history-load" id="historyLoadButton" type="submit">Load</button>
+            <button class="history-load history-add" id="historyAddButton" type="button">Add to History</button>
           </div>
         </form>
 
@@ -1825,6 +1831,7 @@ function getVisualizerPanelHTML(botName: string): string {
     const historyForm = document.getElementById('historyForm');
     const historyIdInput = document.getElementById('historyId');
     const historyLoadButton = document.getElementById('historyLoadButton');
+    const historyAddButton = document.getElementById('historyAddButton');
     const playButton = document.getElementById('playButton');
     const playIcon = document.getElementById('playIcon');
     const downloadButton = document.getElementById('downloadButton');
@@ -1852,6 +1859,7 @@ function getVisualizerPanelHTML(botName: string): string {
     let smoothedEnergy = 0;
     let dpr = Math.min(window.devicePixelRatio || 1, 2);
     let particles = [];
+    const CAPTION_DISPLAY_LAG_SECONDS = 0.3;
 
     title.textContent = BOT_NAME.toUpperCase();
     track.innerHTML = WAVE_HEIGHTS.map((height) => '<span style="height:' + height + '%"></span>').join('');
@@ -2016,7 +2024,7 @@ function getVisualizerPanelHTML(botName: string): string {
       if (!captionLines.length) return;
 
       if (captionCues.length) {
-        const currentTime = audio.currentTime;
+        const currentTime = Math.max(0, audio.currentTime - CAPTION_DISPLAY_LAG_SECONDS);
         let cueIndex = captionCues.findIndex((cue) => currentTime >= cue.start && currentTime < cue.end);
 
         if (cueIndex === -1) {
@@ -2033,7 +2041,8 @@ function getVisualizerPanelHTML(botName: string): string {
       }
 
       if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
-      const progress = audio.duration ? audio.currentTime / audio.duration : 0;
+      const captionTime = Math.max(0, audio.currentTime - CAPTION_DISPLAY_LAG_SECONDS);
+      const progress = audio.duration ? captionTime / audio.duration : 0;
       const index = Math.min(captionLines.length - 1, Math.floor(progress * captionLines.length));
       showCaptionLine(index);
     }
@@ -2063,7 +2072,7 @@ function getVisualizerPanelHTML(botName: string): string {
       return speakUrl;
     }
 
-    async function loadHistoryItem(event) {
+    async function loadHistoryItem(event, addToHistory = false) {
       event.preventDefault();
 
       const historyId = historyIdInput.value.trim();
@@ -2073,13 +2082,18 @@ function getVisualizerPanelHTML(botName: string): string {
       }
 
       historyLoadButton.disabled = true;
-      receiverText.textContent = 'loading history';
-      setMessage('Loading history item');
+      historyAddButton.disabled = true;
+      receiverText.textContent = addToHistory ? 'adding history' : 'loading history';
+      setMessage(addToHistory ? 'Adding history item' : 'Loading history item');
 
       try {
         const historyUrl = new URL('/history', window.location.origin);
         historyUrl.searchParams.set('id', historyId);
-        const response = await fetch(historyUrl.toString(), { cache: 'no-store' });
+        historyUrl.searchParams.set('align', '0');
+        const response = await fetch(historyUrl.toString(), {
+          cache: 'no-store',
+          signal: AbortSignal.timeout(20_000),
+        });
         const data = await response.json();
 
         if (!response.ok || !data.event) {
@@ -2092,11 +2106,16 @@ function getVisualizerPanelHTML(botName: string): string {
         // after this load is allowed to take over again.
         manualVoicePinnedAt = Date.now();
         receiveVoiceEvent(data.event, 'manual');
+        if (addToHistory) {
+          setMessage('Added to History');
+          window.dispatchEvent(new CustomEvent('cattea-history-added'));
+        }
       } catch (error) {
-        receiverText.textContent = 'history load failed';
+        receiverText.textContent = addToHistory ? 'history add failed' : 'history load failed';
         setMessage(error instanceof Error ? error.message : String(error), true);
       } finally {
         historyLoadButton.disabled = false;
+        historyAddButton.disabled = false;
       }
     }
 
@@ -2354,6 +2373,7 @@ function getVisualizerPanelHTML(botName: string): string {
     });
 
     historyForm.addEventListener('submit', loadHistoryItem);
+    historyAddButton.addEventListener('click', (event) => loadHistoryItem(event, true));
 
     dockCloseButton.addEventListener('click', hideDock);
     dockPanel.addEventListener('click', (event) => event.stopPropagation());
@@ -3545,7 +3565,7 @@ export default {
       return handler(request, env, ctx);
     }
 
-    if (path === '/panel' || path === '/panel-v13' || path === '/panel-v14') {
+    if (path === '/panel' || path === '/panel-v13' || path === '/panel-v14' || path === '/panel-v15') {
       const botName = env.BOT_NAME || 'Haven';
       return new Response(getVisualizerPanelHTML(botName), {
         headers: {
