@@ -2728,8 +2728,11 @@ function buildDashScopeText(input: SpeakInput): string {
   return stripAudioTags(input.text);
 }
 
-function addElevenLabsTrailingPause(text: string): string {
-  return text.trimEnd() + "\n\n";
+function addElevenLabsTrailingPause(text: string, useV3Pacing = false): string {
+  // Eleven v3 ignores trailing whitespace. A terminal ellipsis gives that model
+  // actual pacing context so it leaves a small tail instead of clipping the
+  // final spoken word. This prompt-only suffix is not shown in transcripts.
+  return text.trimEnd() + (useV3Pacing ? "\n\n...\n\n" : "\n\n");
 }
 
 function buildElevenLabsText(env: Env, input: SpeakInput): string {
@@ -2740,13 +2743,13 @@ function buildElevenLabsText(env: Env, input: SpeakInput): string {
   }
 
   if (input.raw_tags === true) {
-    return addElevenLabsTrailingPause(input.text);
+    return addElevenLabsTrailingPause(input.text, true);
   }
 
   const text = stripAudioTags(input.text);
   const tag = input.style ? ELEVENLABS_V3_STYLE_TAGS[input.style.trim().toLowerCase()] : undefined;
 
-  return addElevenLabsTrailingPause(tag ? `${tag} ${text}` : text);
+  return addElevenLabsTrailingPause(tag ? `${tag} ${text}` : text, true);
 }
 
 function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
@@ -3688,7 +3691,9 @@ export default {
         });
       }
 
-      const result = await fetchElevenLabsHistoryEvent(env, historyItemId);
+      const result = await fetchElevenLabsHistoryEvent(env, historyItemId, {
+        allowForcedAlignment: url.searchParams.get('align') !== '0',
+      });
       if (!result.success || !result.event) {
         return Response.json({ error: result.error || 'History item unavailable' }, {
           status: 500,
