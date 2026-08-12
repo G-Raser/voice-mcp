@@ -692,6 +692,9 @@ function recentPanelAddon(): string {
 
   closeButton.addEventListener('click', closeHistory);
   syncButton.addEventListener('click', syncRecentVoices);
+  window.addEventListener('cattea-history-added', () => {
+    if (!backdrop.hidden) loadRecentVoices();
+  });
   modal.addEventListener('click', (event) => event.stopPropagation());
   backdrop.addEventListener('click', closeHistory);
   historyAudio.addEventListener('ended', () => {
