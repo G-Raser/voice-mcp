@@ -105,7 +105,7 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v7.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v8.html";
 const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://voice-mcp/player.html",
   "ui://cattea-voice/player-v2.html",
@@ -113,6 +113,7 @@ const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://cattea-voice/player-v4.html",
   "ui://cattea-voice/player-v5.html",
   "ui://cattea-voice/player-v6.html",
+  "ui://cattea-voice/player-v7.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const LATEST_HISTORY_SYNC_PATH = "/__voice-mcp/latest-history-sync";
@@ -124,7 +125,7 @@ const HISTORY_SYNC_INTERVAL_SECONDS = 8;
 // Audio Player HTML (WeChat-style UI)
 // =============================================================================
 
-function getPlayerHTML(botName: string): string {
+function getPlayerHTML(botName: string, origin: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -252,10 +253,15 @@ function getPlayerHTML(botName: string): string {
   <script>
     const contentEl = document.getElementById('content');
     const BOT_NAME = '${botName}';
+    const SERVICE_ORIGIN = ${JSON.stringify(origin)};
+    const WIDGET_MOUNTED_AT = Date.now();
     let waveInterval = null;
     let lastRenderedAudioUrl = '';
     let lastRenderedUsesEmbeddedAudio = false;
     let stopActivePlayback = null;
+    let recoveryTimer = null;
+    let recoveryAttempts = 0;
+    let lastPersistedEventId = '';
     
     function escapeHtml(text) {
       const div = document.createElement('div');
@@ -498,6 +504,91 @@ function getPlayerHTML(botName: string): string {
       });
     }
 
+    function persistWidgetState(data) {
+      if (!data.event_id || data.event_id === lastPersistedEventId) return;
+      const setWidgetState = window.openai?.setWidgetState;
+      if (typeof setWidgetState !== 'function') return;
+      lastPersistedEventId = data.event_id;
+      Promise.resolve(setWidgetState({
+        event_id: data.event_id,
+        text: data.text,
+        created_at: data.created_at,
+        provider: data.provider,
+        model_id: data.model_id,
+        history_item_id: data.history_item_id
+      })).catch(function() {
+        lastPersistedEventId = '';
+      });
+    }
+
+    function normalizeRecoveredEvent(event) {
+      if (!event || !event.id || !event.text || !event.audio_base64) return null;
+      return {
+        text: event.text,
+        audio_url: SERVICE_ORIGIN + '/audio/' + encodeURIComponent(event.id) + '.mp3',
+        audio_base64: event.audio_base64,
+        event_id: event.id,
+        created_at: event.created_at,
+        provider: event.provider,
+        model_id: event.model_id,
+        history_item_id: event.history_item_id
+      };
+    }
+
+    async function fetchRecoveryEvent(widgetState) {
+      const requests = [];
+      if (widgetState?.event_id) {
+        requests.push(SERVICE_ORIGIN + '/events/' + encodeURIComponent(widgetState.event_id));
+      }
+      if (widgetState?.history_item_id) {
+        requests.push(SERVICE_ORIGIN + '/history?id=' + encodeURIComponent(widgetState.history_item_id));
+      }
+      requests.push(SERVICE_ORIGIN + '/events/latest');
+
+      for (const requestUrl of requests) {
+        try {
+          const response = await fetch(requestUrl, { cache: 'no-store' });
+          if (!response.ok) continue;
+          const payload = await response.json();
+          const event = payload.event;
+          if (!event) continue;
+          const matchesPersistedEvent = Boolean(
+            widgetState?.event_id && event.id === widgetState.event_id
+          );
+          const matchesPersistedHistory = Boolean(
+            widgetState?.history_item_id && event.history_item_id === widgetState.history_item_id
+          );
+          const createdAt = Date.parse(event.created_at || '');
+          const isFresh = Number.isFinite(createdAt) && createdAt >= WIDGET_MOUNTED_AT - 60_000;
+          if (!widgetState && !isFresh) continue;
+          if (widgetState && !matchesPersistedEvent && !matchesPersistedHistory) continue;
+          const recovered = normalizeRecoveredEvent(event);
+          if (recovered) return recovered;
+        } catch (_error) {}
+      }
+      return null;
+    }
+
+    async function recoverVoice(widgetState) {
+      if (lastRenderedAudioUrl) return;
+      const recovered = await fetchRecoveryEvent(widgetState);
+      if (recovered && handleData(recovered)) return;
+      recoveryAttempts += 1;
+      if (recoveryAttempts < 20 && !lastRenderedAudioUrl) {
+        recoveryTimer = setTimeout(function() { recoverVoice(widgetState); }, 1000);
+      } else if (!lastRenderedAudioUrl) {
+        showError('Voice is ready, but the inline player could not reconnect. Open the voice panel to play it.');
+      }
+    }
+
+    function scheduleRecovery(widgetState, delay) {
+      if (lastRenderedAudioUrl || recoveryTimer) return;
+      recoveryTimer = setTimeout(function() {
+        recoveryTimer = null;
+        recoverVoice(widgetState);
+      }, delay ?? 800);
+    }
+
     function handleData(data, inheritedAudioBase64) {
       if (!data || typeof data !== 'object') return false;
       const audioBase64 = inheritedAudioBase64 || findAudioBase64(data, 0);
@@ -510,6 +601,7 @@ function getPlayerHTML(botName: string): string {
       }
       if (data.error) { showError(data.error); return true; }
       if (data.audio_url && data.text) {
+        persistWidgetState(data);
         announceVoice(data, audioBase64);
         if (data.audio_url !== lastRenderedAudioUrl || (audioBase64 && !lastRenderedUsesEmbeddedAudio)) {
           renderPlayer(data.text, data.audio_url, audioBase64, data.audio_request);
@@ -523,11 +615,14 @@ function getPlayerHTML(botName: string): string {
       const openai = window.openai;
       const toolOutput = globals?.toolOutput ?? openai?.toolOutput;
       const metadata = globals?.toolResponseMetadata ?? openai?.toolResponseMetadata;
+      const widgetState = globals?.widgetState ?? openai?.widgetState;
       const audioBase64 = findAudioBase64(metadata, 0);
       if (handleData(toolOutput, audioBase64)) return true;
-      return handleData(metadata?.mcp_tool_result) ||
+      const handled = handleData(metadata?.mcp_tool_result) ||
         handleData(metadata?.call_tool_result) ||
         handleData(metadata);
+      if (!handled) scheduleRecovery(widgetState, widgetState ? 100 : 800);
+      return handled;
     }
     
     const pendingRequests = new Map();
@@ -564,7 +659,7 @@ function getPlayerHTML(botName: string): string {
         }
       }
       if (msg.method === 'ui/notifications/tool-result') {
-        handleData(msg.params);
+        if (!handleData(msg.params)) scheduleRecovery(null, 100);
       }
       if (msg.structuredContent) handleData(msg.structuredContent);
     }, { passive: true });
@@ -583,7 +678,7 @@ function getPlayerHTML(botName: string): string {
         notifyHost('ui/notifications/initialized', {});
         hydrateFromOpenAi();
       } catch (_error) {
-        showError('Voice player failed to initialize.');
+        scheduleRecovery(window.openai?.widgetState, 100);
       }
     }
 
@@ -3277,7 +3372,7 @@ function createAudioResponse(request: Request, audioBase64: string): Response {
 
 function createVoiceServer(env: Env, origin: string): McpServer {
   const botName = env.BOT_NAME || 'AI';
-  const PLAYER_HTML = getPlayerHTML(botName);
+  const PLAYER_HTML = getPlayerHTML(botName, origin);
 
   const server = new McpServer({
     name: "voice-mcp",
@@ -3454,6 +3549,20 @@ export default {
           ...corsHeaders,
           "Cache-Control": "no-store",
         },
+      });
+    }
+
+    const eventJsonPathMatch = /^\/events\/([0-9a-f-]{36})$/i.exec(path);
+    if (eventJsonPathMatch && request.method === 'GET') {
+      const event = await readVoiceEvent(url.origin, eventJsonPathMatch[1]);
+      if (!event) {
+        return Response.json({ event: null }, {
+          status: 404,
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      }
+      return Response.json({ event }, {
+        headers: { ...corsHeaders, "Cache-Control": "no-store" },
       });
     }
 
