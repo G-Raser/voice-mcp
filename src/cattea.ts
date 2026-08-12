@@ -4,7 +4,7 @@ const DEFAULT_BOT_NAME = "CatTea";
 const RECENT_INDEX_PATH = "/__cattea/recent-index";
 const RECENT_EVENT_PREFIX = "/__cattea/recent-event/";
 const RECENT_LIMIT = 12;
-const RECENT_API_VERSION = "v12";
+const RECENT_API_VERSION = "v13";
 
 type VoiceEvent = {
   id: string;
@@ -450,23 +450,10 @@ function recentPanelAddon(): string {
       setHistoryError('');
       const audioEndpoint = '/events/recent/audio?id=' + encodeURIComponent(id)
         + '&history_version=${RECENT_API_VERSION}&_=' + Date.now();
-      const response = await fetch(audioEndpoint, { cache: 'no-store' });
-      if (!response.ok) {
-        let message = 'Recent voice unavailable (' + response.status + ')';
-        try {
-          const data = await response.json();
-          if (data.error) message = data.error;
-        } catch (_error) {}
-        throw new Error(message);
-      }
-      const audioBlob = await response.blob();
-      if (!audioBlob.size || !audioBlob.type.startsWith('audio/')) {
-        throw new Error('The recovered voice is not a playable audio file');
-      }
-
       if (historyObjectUrl) URL.revokeObjectURL(historyObjectUrl);
-      historyObjectUrl = URL.createObjectURL(audioBlob);
-      historyAudio.src = historyObjectUrl;
+      historyObjectUrl = '';
+      historyAudio.pause();
+      historyAudio.src = audioEndpoint;
       historyAudio.load();
       setActiveButton(button, true);
       await historyAudio.play();
@@ -719,7 +706,7 @@ export default {
     let response = await worker.fetch(request, env, ctx);
     const contentType = response.headers.get("Content-Type") || "";
 
-    if (path === "/panel" && contentType.includes("text/html")) {
+    if ((path === "/panel" || path === "/panel-v13") && contentType.includes("text/html")) {
       const personalizedHtml = personalizePanelHtml(await response.text());
       return new Response(personalizedHtml, {
         status: response.status,
