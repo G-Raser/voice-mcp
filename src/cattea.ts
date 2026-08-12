@@ -21,6 +21,15 @@ type RecentVoiceMeta = {
   created_at: string;
   provider?: string;
   model_id?: string;
+  history_item_id?: string;
+};
+
+type ElevenLabsHistoryItem = {
+  history_item_id?: string;
+  date_unix?: number;
+  voice_id?: string | null;
+  model_id?: string | null;
+  text?: string | null;
 };
 
 type McpRequestInfo = {
@@ -58,6 +67,7 @@ async function appendRecentEvent(origin: string, event: VoiceEvent): Promise<voi
     created_at: event.created_at || new Date().toISOString(),
     provider: event.provider,
     model_id: event.model_id,
+    history_item_id: typeof event.history_item_id === "string" ? event.history_item_id : undefined,
   };
   const next = [meta, ...current.filter((item) => item.id !== meta.id)].slice(0, RECENT_LIMIT);
 
@@ -80,6 +90,80 @@ async function captureLatestVoiceEvent(origin: string, env: Env, ctx: ExecutionC
   } catch (error) {
     console.error("Failed to capture recent CatTea voice event", error);
   }
+}
+
+function getConfiguredElevenLabsVoiceIds(env: Env): Set<string> {
+  return new Set([
+    env.ELEVENLABS_VOICE_ID,
+    env.ELEVENLABS_VOICE_ID_ZH,
+    env.ELEVENLABS_VOICE_ID_EN,
+  ].filter((voiceId): voiceId is string => Boolean(voiceId)));
+}
+
+function isValidHistoryItemId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{8,128}$/.test(value);
+}
+
+async function fetchRecentElevenLabsVoices(env: Env): Promise<RecentVoiceMeta[]> {
+  if (!env.ELEVENLABS_API_KEY) return [];
+
+  try {
+    const historyUrl = new URL("https://api.elevenlabs.io/v1/history");
+    historyUrl.searchParams.set("page_size", "20");
+    const response = await fetch(historyUrl.toString(), {
+      headers: {
+        "xi-api-key": env.ELEVENLABS_API_KEY,
+        "Accept": "application/json",
+      },
+    });
+    if (!response.ok) {
+      console.error("Failed to load recent ElevenLabs voices", response.status, await response.text());
+      return [];
+    }
+
+    const data = await response.json() as { history?: ElevenLabsHistoryItem[] };
+    const history = Array.isArray(data.history) ? data.history : [];
+    const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
+    const matchingHistory = configuredVoiceIds.size
+      ? history.filter((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id))
+      : history;
+
+    return matchingHistory
+      .filter((item): item is ElevenLabsHistoryItem & { history_item_id: string } => (
+        typeof item.history_item_id === "string" && isValidHistoryItemId(item.history_item_id)
+      ))
+      .map((item) => ({
+        id: `elevenlabs-${item.history_item_id}`,
+        text: item.text?.trim() || "Voice clip",
+        created_at: typeof item.date_unix === "number" && Number.isFinite(item.date_unix)
+          ? new Date(item.date_unix * 1000).toISOString()
+          : new Date().toISOString(),
+        provider: "elevenlabs",
+        model_id: item.model_id || "eleven_v3",
+        history_item_id: item.history_item_id,
+      }));
+  } catch (error) {
+    console.error("Failed to load recent ElevenLabs voices", error);
+    return [];
+  }
+}
+
+function mergeRecentVoices(cached: RecentVoiceMeta[], history: RecentVoiceMeta[]): RecentVoiceMeta[] {
+  const merged = new Map<string, RecentVoiceMeta>();
+
+  for (const item of [...cached, ...history]) {
+    const key = item.history_item_id ? `history:${item.history_item_id}` : `event:${item.id}`;
+    const existing = merged.get(key);
+    if (!existing || Date.parse(item.created_at) > Date.parse(existing.created_at)) {
+      merged.set(key, item);
+    } else if (existing.id.startsWith("elevenlabs-") && !item.id.startsWith("elevenlabs-")) {
+      merged.set(key, { ...existing, ...item });
+    }
+  }
+
+  return [...merged.values()]
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+    .slice(0, RECENT_LIMIT);
 }
 
 async function readMcpRequestInfo(request: Request): Promise<McpRequestInfo> {
@@ -440,11 +524,20 @@ function personalizePanelHtml(html: string): string {
   return personalized.replace("</body>", recentPanelAddon() + "\n</body>");
 }
 
-async function handleRecentEvents(request: Request, origin: string): Promise<Response> {
+async function handleRecentEvents(
+  request: Request,
+  origin: string,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const url = new URL(request.url);
   const id = url.searchParams.get("id")?.trim();
   if (!id) {
-    return Response.json({ events: await readRecentIndex(origin) }, {
+    const [cached, history] = await Promise.all([
+      readRecentIndex(origin),
+      fetchRecentElevenLabsVoices(env),
+    ]);
+    return Response.json({ events: mergeRecentVoices(cached, history) }, {
       headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
     });
   }
@@ -452,6 +545,16 @@ async function handleRecentEvents(request: Request, origin: string): Promise<Res
   const response = await caches.default.match(
     cacheRequest(origin, RECENT_EVENT_PREFIX + encodeURIComponent(id)),
   );
+  if (!response && id.startsWith("elevenlabs-")) {
+    const historyItemId = id.slice("elevenlabs-".length);
+    if (isValidHistoryItemId(historyItemId)) {
+      return worker.fetch(
+        new Request(new URL(`/history?id=${encodeURIComponent(historyItemId)}&align=0`, origin).toString()),
+        env,
+        ctx,
+      );
+    }
+  }
   if (!response) {
     return Response.json({ error: "Recent voice not found" }, {
       status: 404,
@@ -473,7 +576,7 @@ export default {
     const origin = url.origin;
 
     if (path === "/events/recent" && request.method === "GET") {
-      return handleRecentEvents(request, origin);
+      return handleRecentEvents(request, origin, env, ctx);
     }
 
     const mcpInfo = path === "/mcp" || path === "/mcp/" || path === "/sse"
