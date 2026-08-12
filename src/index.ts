@@ -2596,21 +2596,25 @@ function buildDashScopeText(input: SpeakInput): string {
   return stripAudioTags(input.text);
 }
 
+function addElevenLabsTrailingPause(text: string): string {
+  return text.trimEnd() + "\n\n";
+}
+
 function buildElevenLabsText(env: Env, input: SpeakInput): string {
   const modelId = getElevenLabsModel(env);
 
   if (modelId !== "eleven_v3") {
-    return stripAudioTags(input.text);
+    return addElevenLabsTrailingPause(stripAudioTags(input.text));
   }
 
   if (input.raw_tags === true) {
-    return input.text;
+    return addElevenLabsTrailingPause(input.text);
   }
 
   const text = stripAudioTags(input.text);
   const tag = input.style ? ELEVENLABS_V3_STYLE_TAGS[input.style.trim().toLowerCase()] : undefined;
 
-  return tag ? `${tag} ${text}` : text;
+  return addElevenLabsTrailingPause(tag ? `${tag} ${text}` : text);
 }
 
 function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
