@@ -149,42 +149,216 @@ async function patchMcpResourceResponse(response: Response): Promise<Response> {
 function recentPanelAddon(): string {
   return `
 <style>
-  .cattea-recent { display: grid; gap: 8px; margin-top: 4px; }
-  .cattea-recent-title { color: var(--muted); font-size: 0.78rem; letter-spacing: 0.12em; text-transform: uppercase; }
-  .cattea-recent-list { display: grid; gap: 6px; max-height: 180px; overflow: auto; }
-  .cattea-recent-item { width: 100%; border: 1px solid var(--line); border-radius: 12px; background: transparent; color: var(--muted); padding: 8px 10px; text-align: left; cursor: pointer; }
-  .cattea-recent-item:hover, .cattea-recent-item:focus-visible { color: var(--ink); border-color: var(--ice); outline: none; }
-  .cattea-recent-item strong { display: block; color: inherit; font-size: 0.86rem; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cattea-recent-item span { display: block; margin-top: 3px; color: var(--faint); font-size: 0.74rem; }
+  .cattea-history-trigger {
+    min-height: 34px;
+    border: 1px solid color-mix(in oklch, var(--line), transparent 8%);
+    border-radius: 999px;
+    background: oklch(0.08 0.012 220 / 0.62);
+    color: var(--muted);
+    padding: 0 13px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .cattea-history-trigger:hover, .cattea-history-trigger:focus-visible {
+    color: var(--ice);
+    border-color: color-mix(in oklch, var(--ice), var(--line) 34%);
+    outline: none;
+  }
+  .cattea-history-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    padding: 18px;
+    background: rgba(0, 0, 0, 0.58);
+    backdrop-filter: blur(10px);
+  }
+  .cattea-history-backdrop[hidden] { display: none; }
+  .cattea-history-modal {
+    width: min(620px, 100%);
+    max-height: min(72vh, 720px);
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    background: color-mix(in oklch, var(--panel-strong), black 8%);
+    box-shadow: 0 28px 90px rgba(0, 0, 0, 0.52);
+  }
+  .cattea-history-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid color-mix(in oklch, var(--line), transparent 18%);
+  }
+  .cattea-history-title {
+    color: var(--ink);
+    font-size: 0.9rem;
+    font-weight: 720;
+    letter-spacing: 0.02em;
+  }
+  .cattea-history-close {
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .cattea-history-close:hover, .cattea-history-close:focus-visible {
+    color: var(--ice);
+    outline: none;
+  }
+  .cattea-history-list {
+    min-height: 120px;
+    display: grid;
+    gap: 8px;
+    overflow: auto;
+    padding: 12px;
+  }
+  .cattea-history-item {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 10px;
+    align-items: center;
+    border: 1px solid color-mix(in oklch, var(--line), transparent 10%);
+    border-radius: 14px;
+    background: oklch(0.08 0.012 220 / 0.46);
+    color: var(--muted);
+    padding: 9px 11px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .cattea-history-item:hover, .cattea-history-item:focus-visible {
+    color: var(--ink);
+    border-color: color-mix(in oklch, var(--ice), var(--line) 30%);
+    outline: none;
+  }
+  .cattea-history-play {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: color-mix(in oklch, var(--green), transparent 12%);
+    color: oklch(0.12 0.03 154);
+    font-size: 0.72rem;
+  }
+  .cattea-history-copy { min-width: 0; }
+  .cattea-history-copy strong {
+    display: block;
+    color: inherit;
+    font-size: 0.86rem;
+    font-weight: 650;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cattea-history-copy span {
+    display: block;
+    margin-top: 3px;
+    color: var(--faint);
+    font-size: 0.74rem;
+  }
+  .cattea-history-empty {
+    min-height: 110px;
+    display: grid;
+    place-items: center;
+    color: var(--faint);
+    font-size: 0.82rem;
+  }
 </style>
 <script>
 (() => {
-  const messageEl = document.getElementById('message');
-  if (!messageEl || document.getElementById('catteaRecentList')) return;
+  const receiver = document.querySelector('.receiver');
+  if (!receiver || document.getElementById('catteaHistoryButton')) return;
 
-  const wrap = document.createElement('div');
-  wrap.className = 'cattea-recent';
-  wrap.innerHTML = '<div class="cattea-recent-title">recent voices</div><div class="cattea-recent-list" id="catteaRecentList"></div>';
-  messageEl.insertAdjacentElement('afterend', wrap);
-  const list = document.getElementById('catteaRecentList');
+  const trigger = document.createElement('button');
+  trigger.id = 'catteaHistoryButton';
+  trigger.className = 'cattea-history-trigger';
+  trigger.type = 'button';
+  trigger.textContent = 'History';
+
+  const receiverActions = receiver.querySelector('.receiver-actions');
+  if (receiverActions) receiverActions.prepend(trigger);
+  else receiver.appendChild(trigger);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'cattea-history-backdrop';
+  backdrop.id = 'catteaHistoryBackdrop';
+  backdrop.hidden = true;
+  backdrop.innerHTML = ` + "`" + `
+    <section class="cattea-history-modal" role="dialog" aria-modal="true" aria-labelledby="catteaHistoryTitle">
+      <div class="cattea-history-head">
+        <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices</div>
+        <button class="cattea-history-close" id="catteaHistoryClose" type="button" aria-label="Close history">×</button>
+      </div>
+      <div class="cattea-history-list" id="catteaHistoryList"></div>
+      <audio id="catteaHistoryAudio" preload="metadata"></audio>
+    </section>
+  ` + "`" + `;
+  document.body.appendChild(backdrop);
+
+  const modal = backdrop.querySelector('.cattea-history-modal');
+  const closeButton = document.getElementById('catteaHistoryClose');
+  const list = document.getElementById('catteaHistoryList');
+  const historyAudio = document.getElementById('catteaHistoryAudio');
+  let historyObjectUrl = '';
+  let activeButton = null;
 
   function formatRecentTime(value) {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  async function openRecentVoice(id) {
+  function setActiveButton(button, playing) {
+    if (activeButton && activeButton !== button) {
+      const previousIcon = activeButton.querySelector('.cattea-history-play');
+      if (previousIcon) previousIcon.textContent = '▶';
+    }
+    activeButton = button;
+    const icon = button?.querySelector('.cattea-history-play');
+    if (icon) icon.textContent = playing ? '❚❚' : '▶';
+  }
+
+  function closeHistory() {
+    backdrop.hidden = true;
+  }
+
+  async function playRecentVoice(id, button) {
     try {
       const response = await fetch('/events/recent?id=' + encodeURIComponent(id), { cache: 'no-store' });
       const data = await response.json();
-      if (!response.ok || !data.event) throw new Error(data.error || 'Recent voice unavailable');
-      if (typeof receiveVoiceEvent === 'function') receiveVoiceEvent(data.event);
+      if (!response.ok || !data.event?.audio_base64) throw new Error(data.error || 'Recent voice unavailable');
+
+      if (historyObjectUrl) URL.revokeObjectURL(historyObjectUrl);
+      const binary = atob(data.event.audio_base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      historyObjectUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+      historyAudio.src = historyObjectUrl;
+      setActiveButton(button, true);
+      await historyAudio.play();
     } catch (error) {
       if (typeof setMessage === 'function') setMessage(error instanceof Error ? error.message : String(error), true);
+      setActiveButton(button, false);
     }
   }
 
   async function loadRecentVoices() {
+    list.replaceChildren();
+    const loading = document.createElement('div');
+    loading.className = 'cattea-history-empty';
+    loading.textContent = 'Loading history…';
+    list.appendChild(loading);
+
     try {
       const response = await fetch('/events/recent', { cache: 'no-store' });
       const data = await response.json();
@@ -192,29 +366,67 @@ function recentPanelAddon(): string {
       list.replaceChildren();
       if (!events.length) {
         const empty = document.createElement('div');
-        empty.style.color = 'var(--faint)';
-        empty.style.fontSize = '0.8rem';
+        empty.className = 'cattea-history-empty';
         empty.textContent = 'No recent voices yet';
         list.appendChild(empty);
         return;
       }
+
       events.forEach((item) => {
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'cattea-recent-item';
+        button.className = 'cattea-history-item';
+
+        const play = document.createElement('span');
+        play.className = 'cattea-history-play';
+        play.textContent = '▶';
+
+        const copy = document.createElement('span');
+        copy.className = 'cattea-history-copy';
         const title = document.createElement('strong');
         title.textContent = item.text || 'Voice clip';
         const meta = document.createElement('span');
         meta.textContent = [formatRecentTime(item.created_at), item.model_id || ''].filter(Boolean).join(' · ');
-        button.append(title, meta);
-        button.addEventListener('click', () => openRecentVoice(item.id));
+        copy.append(title, meta);
+        button.append(play, copy);
+        button.addEventListener('click', () => {
+          if (activeButton === button && !historyAudio.paused) {
+            historyAudio.pause();
+            setActiveButton(button, false);
+            return;
+          }
+          playRecentVoice(item.id, button);
+        });
         list.appendChild(button);
       });
-    } catch (_error) {}
+    } catch (_error) {
+      list.replaceChildren();
+      const failed = document.createElement('div');
+      failed.className = 'cattea-history-empty';
+      failed.textContent = 'History unavailable';
+      list.appendChild(failed);
+    }
   }
 
-  loadRecentVoices();
-  setInterval(loadRecentVoices, 3000);
+  trigger.addEventListener('click', async (event) => {
+    event.stopPropagation();
+    backdrop.hidden = false;
+    await loadRecentVoices();
+    closeButton.focus();
+  });
+
+  closeButton.addEventListener('click', closeHistory);
+  modal.addEventListener('click', (event) => event.stopPropagation());
+  backdrop.addEventListener('click', closeHistory);
+  historyAudio.addEventListener('ended', () => {
+    if (activeButton) setActiveButton(activeButton, false);
+  });
+  historyAudio.addEventListener('pause', () => {
+    if (activeButton && historyAudio.currentTime < historyAudio.duration) setActiveButton(activeButton, false);
+  });
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !backdrop.hidden) closeHistory();
+  });
 })();
 </script>`;
 }
