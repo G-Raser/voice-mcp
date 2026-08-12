@@ -3545,7 +3545,7 @@ export default {
       return handler(request, env, ctx);
     }
 
-    if (path === '/panel' || path === '/panel-v13') {
+    if (path === '/panel' || path === '/panel-v13' || path === '/panel-v14') {
       const botName = env.BOT_NAME || 'Haven';
       return new Response(getVisualizerPanelHTML(botName), {
         headers: {
