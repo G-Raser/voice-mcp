@@ -35,6 +35,7 @@ export interface Env {
   ELEVENLABS_STYLE?: string;
   ELEVENLABS_USE_SPEAKER_BOOST?: string;
   ELEVENLABS_SPEED?: string;
+  AUDIO_URL_SIGNING_KEY?: string;
   BOT_NAME?: string;
 }
 
@@ -103,14 +104,16 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v4.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v5.html";
 const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://voice-mcp/player.html",
   "ui://cattea-voice/player-v2.html",
   "ui://cattea-voice/player-v3.html",
+  "ui://cattea-voice/player-v4.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
+const AUDIO_REPLAY_PATH = "/audio/replay";
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
@@ -248,6 +251,7 @@ function getPlayerHTML(botName: string): string {
     let audioObjectUrl = null;
     let waveInterval = null;
     let lastRenderedAudioUrl = '';
+    let lastRenderedUsesEmbeddedAudio = false;
     
     function escapeHtml(text) {
       const div = document.createElement('div');
@@ -270,12 +274,13 @@ function getPlayerHTML(botName: string): string {
       return heights.map(h => '<div class="wave-bar" style="height:' + h + '%"></div>').join('');
     }
     
-    function renderPlayer(text, audioUrl, audioBase64) {
+    function renderPlayer(text, audioUrl, audioBase64, audioRequest) {
       if (audioObjectUrl) {
         URL.revokeObjectURL(audioObjectUrl);
         audioObjectUrl = null;
       }
       lastRenderedAudioUrl = audioUrl || '';
+      lastRenderedUsesEmbeddedAudio = Boolean(audioBase64);
       contentEl.innerHTML = 
         '<div class="player">' +
           '<button class="play-btn" id="playBtn">' +
@@ -313,7 +318,12 @@ function getPlayerHTML(botName: string): string {
         if (audioBase64) {
           blob = base64ToBlob(audioBase64);
         } else {
-          const response = await fetch(audioUrl);
+          const requestOptions = audioRequest ? {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(audioRequest)
+          } : undefined;
+          const response = await fetch(audioUrl, requestOptions);
           if (!response.ok) throw new Error('Audio request failed (' + response.status + ').');
           blob = await response.blob();
         }
@@ -399,11 +409,22 @@ function getPlayerHTML(botName: string): string {
       }, 150);
     }
     
-    function handleData(data) {
+    function findAudioBase64(data, depth) {
+      if (!data || typeof data !== 'object' || (depth || 0) > 5) return '';
+      if (typeof data.audio_base64 === 'string' && data.audio_base64) return data.audio_base64;
+      const keys = ['_meta', 'mcp_tool_result', 'call_tool_result', 'tool_result', 'result'];
+      for (const key of keys) {
+        const found = findAudioBase64(data[key], (depth || 0) + 1);
+        if (found) return found;
+      }
+      return '';
+    }
+
+    function handleData(data, inheritedAudioBase64) {
       if (!data || typeof data !== 'object') return false;
+      const audioBase64 = inheritedAudioBase64 || findAudioBase64(data, 0);
       if (data.structuredContent) {
         const structured = data.structuredContent;
-        const audioBase64 = data._meta?.audio_base64;
         if (audioBase64 && !structured.audio_base64) {
           return handleData({ ...structured, audio_base64: audioBase64 });
         }
@@ -411,8 +432,8 @@ function getPlayerHTML(botName: string): string {
       }
       if (data.error) { showError(data.error); return true; }
       if (data.audio_url && data.text) {
-        if (data.audio_url !== lastRenderedAudioUrl) {
-          renderPlayer(data.text, data.audio_url, data.audio_base64);
+        if (data.audio_url !== lastRenderedAudioUrl || (audioBase64 && !lastRenderedUsesEmbeddedAudio)) {
+          renderPlayer(data.text, data.audio_url, audioBase64, data.audio_request);
         }
         return true;
       }
@@ -422,9 +443,9 @@ function getPlayerHTML(botName: string): string {
     function hydrateFromOpenAi(globals) {
       const openai = window.openai;
       const toolOutput = globals?.toolOutput ?? openai?.toolOutput;
-      if (handleData(toolOutput)) return true;
-
       const metadata = globals?.toolResponseMetadata ?? openai?.toolResponseMetadata;
+      const audioBase64 = findAudioBase64(metadata, 0);
+      if (handleData(toolOutput, audioBase64)) return true;
       return handleData(metadata?.mcp_tool_result) ||
         handleData(metadata?.call_tool_result) ||
         handleData(metadata);
@@ -2930,6 +2951,62 @@ function getVoiceEventCacheRequest(origin: string, id: string): Request {
   });
 }
 
+function getAudioSigningSecret(env: Env): string {
+  return env.AUDIO_URL_SIGNING_KEY || env.ELEVENLABS_API_KEY || env.DASHSCOPE_API_KEY || "";
+}
+
+function getAudioReplayPayload(expires: number, input: SpeakInput): string {
+  return JSON.stringify({
+    expires,
+    text: input.text,
+    style: input.style || "",
+    raw_tags: Boolean(input.raw_tags),
+  });
+}
+
+function arrayBufferToBase64Url(value: ArrayBuffer): string {
+  const bytes = new Uint8Array(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function signAudioReplay(env: Env, expires: number, input: SpeakInput): Promise<string> {
+  const secret = getAudioSigningSecret(env);
+  if (!secret) throw new Error("Audio replay signing key is not configured");
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(getAudioReplayPayload(expires, input)),
+  );
+  return arrayBufferToBase64Url(signature);
+}
+
+function signaturesMatch(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index++) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+async function createAudioReplayUrl(env: Env, origin: string, input: SpeakInput): Promise<string> {
+  const expires = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+  const signature = await signAudioReplay(env, expires, input);
+  const url = new URL(AUDIO_REPLAY_PATH, origin);
+  url.searchParams.set("expires", String(expires));
+  url.searchParams.set("signature", signature);
+  return url.toString();
+}
+
 function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): VoiceEvent {
   const provider = getTtsProvider(env);
   const finalText = result.final_text || input.text;
@@ -3107,6 +3184,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
         } catch (error) {
           console.error("Failed to store latest voice event", error);
         }
+        const audioUrl = await createAudioReplayUrl(env, origin, input);
 
         return {
           content: [
@@ -3114,7 +3192,8 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           ],
           structuredContent: {
             text: text,
-            audio_url: new URL(`/audio/${event.id}.mp3`, origin).toString(),
+            audio_url: audioUrl,
+            audio_request: input,
           },
           _meta: { audio_base64: result.audio_base64 },
         };
@@ -3191,6 +3270,51 @@ export default {
           "Cache-Control": "no-store",
         },
       });
+    }
+
+    if (path === AUDIO_REPLAY_PATH && request.method === 'POST') {
+      const expires = Number(url.searchParams.get('expires'));
+      const signature = url.searchParams.get('signature') || '';
+      if (!Number.isSafeInteger(expires) || expires < Math.floor(Date.now() / 1000) || !signature) {
+        return Response.json({ error: 'Audio replay link expired or invalid' }, {
+          status: 403,
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      }
+
+      let input: SpeakInput;
+      try {
+        const body = await request.json() as Partial<SpeakInput>;
+        if (typeof body.text !== 'string') throw new Error('Missing text parameter');
+        input = normalizeSpeakInput({
+          text: body.text,
+          style: typeof body.style === 'string' ? body.style : undefined,
+          raw_tags: typeof body.raw_tags === 'boolean' ? body.raw_tags : undefined,
+        });
+      } catch (error) {
+        return Response.json({ error: error instanceof Error ? error.message : 'Invalid audio request' }, {
+          status: 400,
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      }
+
+      const inputError = getSpeakInputError(input.text);
+      const expectedSignature = await signAudioReplay(env, expires, input);
+      if (inputError || !signaturesMatch(signature, expectedSignature)) {
+        return Response.json({ error: inputError || 'Audio replay signature mismatch' }, {
+          status: 403,
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      }
+
+      const result = await generateAudio(env, input);
+      if (!result.success || !result.audio_base64) {
+        return Response.json({ error: result.error || 'Voice generation failed' }, {
+          status: 502,
+          headers: { ...corsHeaders, "Cache-Control": "no-store" },
+        });
+      }
+      return createAudioResponse(request, result.audio_base64);
     }
 
     const audioPathMatch = /^\/audio\/([0-9a-f-]+)\.mp3$/i.exec(path);
