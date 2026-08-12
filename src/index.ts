@@ -104,6 +104,7 @@ interface ElevenLabsHistoryItem {
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
 const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v2.html";
+const LEGACY_VOICE_RESOURCE_URIS = ["ui://voice-mcp/player.html"] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
 
@@ -2931,36 +2932,38 @@ function createVoiceServer(env: Env, origin: string): McpServer {
   } as unknown as Parameters<typeof server.server.registerCapabilities>[0];
   server.server.registerCapabilities(uiCapabilities);
 
-  server.resource(
-    VOICE_RESOURCE_URI,
-    VOICE_RESOURCE_URI,
-    { mimeType: EXT_APPS_MIME, description: "Voice Player" },
-    async () => ({
-      contents: [
-        {
-          uri: VOICE_RESOURCE_URI,
-          mimeType: EXT_APPS_MIME,
-          text: PLAYER_HTML,
-          _meta: {
-            ui: {
-              prefersBorder: true,
-              domain: origin,
-              csp: {
-                connectDomains: [origin],
-                resourceDomains: [origin],
+  for (const resourceUri of [VOICE_RESOURCE_URI, ...LEGACY_VOICE_RESOURCE_URIS]) {
+    server.resource(
+      resourceUri,
+      resourceUri,
+      { mimeType: EXT_APPS_MIME, description: "Voice Player" },
+      async () => ({
+        contents: [
+          {
+            uri: resourceUri,
+            mimeType: EXT_APPS_MIME,
+            text: PLAYER_HTML,
+            _meta: {
+              ui: {
+                prefersBorder: true,
+                domain: origin,
+                csp: {
+                  connectDomains: [origin],
+                  resourceDomains: [origin],
+                },
+              },
+              "openai/widgetPrefersBorder": true,
+              "openai/widgetDomain": origin,
+              "openai/widgetCSP": {
+                connect_domains: [origin],
+                resource_domains: [origin],
               },
             },
-            "openai/widgetPrefersBorder": true,
-            "openai/widgetDomain": origin,
-            "openai/widgetCSP": {
-              connect_domains: [origin],
-              resource_domains: [origin],
-            },
           },
-        },
-      ],
-    }),
-  );
+        ],
+      }),
+    );
+  }
 
   server.registerTool(
     "speak",
