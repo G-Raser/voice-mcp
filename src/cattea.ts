@@ -4,6 +4,7 @@ const DEFAULT_BOT_NAME = "CatTea";
 const RECENT_INDEX_PATH = "/__cattea/recent-index";
 const RECENT_EVENT_PREFIX = "/__cattea/recent-event/";
 const RECENT_LIMIT = 12;
+const RECENT_API_VERSION = "v12";
 
 type VoiceEvent = {
   id: string;
@@ -149,9 +150,19 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<RecentVoiceMeta[]>
 }
 
 function mergeRecentVoices(cached: RecentVoiceMeta[], history: RecentVoiceMeta[]): RecentVoiceMeta[] {
+  const enrichedCached = cached.map((item) => {
+    if (item.history_item_id) return item;
+    const createdAt = Date.parse(item.created_at);
+    const match = history.find((historyItem) => (
+      historyItem.text.trim() === item.text.trim()
+      && Number.isFinite(createdAt)
+      && Math.abs(Date.parse(historyItem.created_at) - createdAt) <= 90_000
+    ));
+    return match ? { ...item, id: match.id, history_item_id: match.history_item_id } : item;
+  });
   const merged = new Map<string, RecentVoiceMeta>();
 
-  for (const item of [...cached, ...history]) {
+  for (const item of [...enrichedCached, ...history]) {
     const key = item.history_item_id ? `history:${item.history_item_id}` : `event:${item.id}`;
     const existing = merged.get(key);
     if (!existing || Date.parse(item.created_at) > Date.parse(existing.created_at)) {
@@ -263,7 +274,7 @@ function recentPanelAddon(): string {
     width: min(620px, 100%);
     max-height: min(72vh, 720px);
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
     overflow: hidden;
     border: 1px solid var(--line);
     border-radius: 22px;
@@ -306,6 +317,17 @@ function recentPanelAddon(): string {
     overflow: auto;
     padding: 12px;
   }
+  .cattea-history-error {
+    margin: 10px 12px 0;
+    border: 1px solid color-mix(in oklch, #ff6b6b, var(--line) 54%);
+    border-radius: 12px;
+    background: color-mix(in oklch, #ff6b6b, transparent 90%);
+    color: #ff9b9b;
+    padding: 8px 10px;
+    font-size: 0.76rem;
+    line-height: 1.4;
+  }
+  .cattea-history-error[hidden] { display: none; }
   .cattea-history-item {
     width: 100%;
     display: grid;
@@ -384,6 +406,7 @@ function recentPanelAddon(): string {
         <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices</div>
         <button class="cattea-history-close" id="catteaHistoryClose" type="button" aria-label="Close history">×</button>
       </div>
+      <div class="cattea-history-error" id="catteaHistoryError" role="status" hidden></div>
       <div class="cattea-history-list" id="catteaHistoryList"></div>
       <audio id="catteaHistoryAudio" preload="metadata"></audio>
     </section>
@@ -393,6 +416,7 @@ function recentPanelAddon(): string {
   const modal = backdrop.querySelector('.cattea-history-modal');
   const closeButton = document.getElementById('catteaHistoryClose');
   const list = document.getElementById('catteaHistoryList');
+  const historyError = document.getElementById('catteaHistoryError');
   const historyAudio = document.getElementById('catteaHistoryAudio');
   let historyObjectUrl = '';
   let activeButton = null;
@@ -416,27 +440,46 @@ function recentPanelAddon(): string {
     backdrop.hidden = true;
   }
 
+  function setHistoryError(message) {
+    historyError.textContent = message || '';
+    historyError.hidden = !message;
+  }
+
   async function playRecentVoice(id, button) {
     try {
-      const response = await fetch('/events/recent?id=' + encodeURIComponent(id), { cache: 'no-store' });
-      const data = await response.json();
-      if (!response.ok || !data.event?.audio_base64) throw new Error(data.error || 'Recent voice unavailable');
+      setHistoryError('');
+      const audioEndpoint = '/events/recent/audio?id=' + encodeURIComponent(id)
+        + '&history_version=${RECENT_API_VERSION}&_=' + Date.now();
+      const response = await fetch(audioEndpoint, { cache: 'no-store' });
+      if (!response.ok) {
+        let message = 'Recent voice unavailable (' + response.status + ')';
+        try {
+          const data = await response.json();
+          if (data.error) message = data.error;
+        } catch (_error) {}
+        throw new Error(message);
+      }
+      const audioBlob = await response.blob();
+      if (!audioBlob.size || !audioBlob.type.startsWith('audio/')) {
+        throw new Error('The recovered voice is not a playable audio file');
+      }
 
       if (historyObjectUrl) URL.revokeObjectURL(historyObjectUrl);
-      const binary = atob(data.event.audio_base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      historyObjectUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+      historyObjectUrl = URL.createObjectURL(audioBlob);
       historyAudio.src = historyObjectUrl;
+      historyAudio.load();
       setActiveButton(button, true);
       await historyAudio.play();
     } catch (error) {
-      if (typeof setMessage === 'function') setMessage(error instanceof Error ? error.message : String(error), true);
+      const message = error instanceof Error ? error.message : String(error);
+      setHistoryError(message);
+      if (typeof setMessage === 'function') setMessage(message, true);
       setActiveButton(button, false);
     }
   }
 
   async function loadRecentVoices() {
+    setHistoryError('');
     list.replaceChildren();
     const loading = document.createElement('div');
     loading.className = 'cattea-history-empty';
@@ -444,7 +487,7 @@ function recentPanelAddon(): string {
     list.appendChild(loading);
 
     try {
-      const response = await fetch('/events/recent', { cache: 'no-store' });
+      const response = await fetch('/events/recent?history_version=${RECENT_API_VERSION}&_=' + Date.now(), { cache: 'no-store' });
       const data = await response.json();
       const events = Array.isArray(data.events) ? data.events : [];
       list.replaceChildren();
@@ -503,6 +546,10 @@ function recentPanelAddon(): string {
   modal.addEventListener('click', (event) => event.stopPropagation());
   backdrop.addEventListener('click', closeHistory);
   historyAudio.addEventListener('ended', () => {
+    if (activeButton) setActiveButton(activeButton, false);
+  });
+  historyAudio.addEventListener('error', () => {
+    setHistoryError('This browser could not decode the recovered voice. Try the download button or reload the panel.');
     if (activeButton) setActiveButton(activeButton, false);
   });
   historyAudio.addEventListener('pause', () => {
@@ -567,6 +614,89 @@ async function handleRecentEvents(
   });
 }
 
+function createRecentAudioResponse(request: Request, audioBase64: string): Response {
+  const binary = atob(audioBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+
+  const headers = new Headers({
+    "Access-Control-Allow-Origin": "*",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+    "CDN-Cache-Control": "no-store",
+    "Cloudflare-CDN-Cache-Control": "no-store",
+    "Content-Type": "audio/mpeg",
+    "X-CatTea-History-Version": RECENT_API_VERSION,
+  });
+  const range = request.headers.get("Range");
+  if (!range) {
+    headers.set("Content-Length", String(bytes.length));
+    return new Response(bytes, { headers });
+  }
+
+  const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+  if (!match) {
+    headers.set("Content-Range", `bytes */${bytes.length}`);
+    return new Response(null, { status: 416, headers });
+  }
+  const start = Number(match[1]);
+  const requestedEnd = match[2] ? Number(match[2]) : bytes.length - 1;
+  const end = Math.min(requestedEnd, bytes.length - 1);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= bytes.length) {
+    headers.set("Content-Range", `bytes */${bytes.length}`);
+    return new Response(null, { status: 416, headers });
+  }
+
+  const chunk = bytes.slice(start, end + 1);
+  headers.set("Content-Length", String(chunk.length));
+  headers.set("Content-Range", `bytes ${start}-${end}/${bytes.length}`);
+  return new Response(chunk, { status: 206, headers });
+}
+
+async function handleRecentAudio(
+  request: Request,
+  origin: string,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const id = new URL(request.url).searchParams.get("id")?.trim();
+  if (!id) {
+    return Response.json({ error: "Missing recent voice ID" }, { status: 400 });
+  }
+
+  const cached = await caches.default.match(
+    cacheRequest(origin, RECENT_EVENT_PREFIX + encodeURIComponent(id)),
+  );
+  if (cached) {
+    const event = await cached.json<VoiceEvent>();
+    if (event.audio_base64) return createRecentAudioResponse(request, event.audio_base64);
+  }
+
+  if (id.startsWith("elevenlabs-")) {
+    const historyItemId = id.slice("elevenlabs-".length);
+    if (isValidHistoryItemId(historyItemId)) {
+      const response = await worker.fetch(
+        new Request(new URL(`/history?id=${encodeURIComponent(historyItemId)}&align=0`, origin).toString()),
+        env,
+        ctx,
+      );
+      if (response.ok) {
+        const data = await response.json<{ event?: VoiceEvent }>();
+        if (data.event?.audio_base64) return createRecentAudioResponse(request, data.event.audio_base64);
+      }
+    }
+  }
+
+  return Response.json({ error: "Recent voice could not be recovered" }, {
+    status: 404,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+      "X-CatTea-History-Version": RECENT_API_VERSION,
+    },
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     env.BOT_NAME = env.BOT_NAME?.trim() || DEFAULT_BOT_NAME;
@@ -577,6 +707,9 @@ export default {
 
     if (path === "/events/recent" && request.method === "GET") {
       return handleRecentEvents(request, origin, env, ctx);
+    }
+    if (path === "/events/recent/audio" && request.method === "GET") {
+      return handleRecentAudio(request, origin, env, ctx);
     }
 
     const mcpInfo = path === "/mcp" || path === "/mcp/" || path === "/sse"
