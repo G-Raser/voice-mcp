@@ -28,7 +28,34 @@ type ElevenLabsHistoryItem = {
   voice_id?: string | null;
   model_id?: string | null;
   text?: string | null;
+  alignments?: unknown;
+  dialogue?: Array<Record<string, unknown>> | null;
 };
+
+function getAlignmentCharacters(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const characters = record.characters || record.chars;
+  if (Array.isArray(characters)) {
+    const text = characters.map((character) => String(character)).join("").trim();
+    if (text) return text;
+  }
+  return getAlignmentCharacters(record.alignment) || getAlignmentCharacters(record.normalized_alignment);
+}
+
+function getHistoryText(metadata: ElevenLabsHistoryItem, historyItemId: string): string {
+  const directText = metadata.text?.trim();
+  if (directText) return directText;
+
+  const dialogueText = metadata.dialogue
+    ?.map((entry) => typeof entry.text === "string" ? entry.text.trim() : "")
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+  if (dialogueText) return dialogueText;
+
+  return getAlignmentCharacters(metadata.alignments) || `ElevenLabs history ${historyItemId}`;
+}
 
 function isValidHistoryItemId(value: string): boolean {
   return /^[A-Za-z0-9_-]{6,128}$/.test(value);
@@ -103,7 +130,15 @@ export class VoiceHistoryStore {
       model_id: event.model_id,
       history_item_id: event.history_item_id,
     };
-    await this.writeIndex([meta, ...current.filter((item) => item.id !== event.id)]);
+    const createdAt = Date.parse(event.created_at);
+    await this.writeIndex([meta, ...current.filter((item) => {
+      if (item.id === event.id) return false;
+      if (event.history_item_id && item.history_item_id === event.history_item_id) return false;
+      const sameRecoveredClip = item.text.trim() === event.text.trim()
+        && Number.isFinite(createdAt)
+        && Math.abs(Date.parse(item.created_at) - createdAt) <= 90_000;
+      return !sameRecoveredClip;
+    })]);
   }
 
   private async getEvent(id: string): Promise<GlobalVoiceEvent | null> {
@@ -176,7 +211,7 @@ export class VoiceHistoryStore {
     if (!isValidHistoryItemId(historyItemId)) throw new Error("Invalid ElevenLabs history item ID");
     const id = `elevenlabs-${historyItemId}`;
     const cached = await this.getEvent(id);
-    if (cached) return cached;
+    if (cached && !cached.text.startsWith("ElevenLabs history ")) return cached;
     if (!this.env.ELEVENLABS_API_KEY) throw new Error("ElevenLabs API key is unavailable");
 
     const historyUrl = `https://api.elevenlabs.io/v1/history/${encodeURIComponent(historyItemId)}`;
@@ -191,7 +226,7 @@ export class VoiceHistoryStore {
     const metadata = await metadataResponse.json() as ElevenLabsHistoryItem;
     const event: GlobalVoiceEvent = {
       id,
-      text: metadata.text?.trim() || `ElevenLabs history ${historyItemId}`,
+      text: getHistoryText(metadata, historyItemId),
       audio_base64: arrayBufferToBase64(await audioResponse.arrayBuffer()),
       created_at: typeof metadata.date_unix === "number" && Number.isFinite(metadata.date_unix)
         ? new Date(metadata.date_unix * 1000).toISOString()
