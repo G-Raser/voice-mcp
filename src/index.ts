@@ -103,10 +103,11 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v3.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v4.html";
 const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://voice-mcp/player.html",
   "ui://cattea-voice/player-v2.html",
+  "ui://cattea-voice/player-v3.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
@@ -244,7 +245,9 @@ function getPlayerHTML(botName: string): string {
     const contentEl = document.getElementById('content');
     const BOT_NAME = '${botName}';
     let audio = null;
+    let audioObjectUrl = null;
     let waveInterval = null;
+    let lastRenderedAudioUrl = '';
     
     function escapeHtml(text) {
       const div = document.createElement('div');
@@ -267,7 +270,12 @@ function getPlayerHTML(botName: string): string {
       return heights.map(h => '<div class="wave-bar" style="height:' + h + '%"></div>').join('');
     }
     
-    function renderPlayer(text, audioUrl) {
+    function renderPlayer(text, audioUrl, audioBase64) {
+      if (audioObjectUrl) {
+        URL.revokeObjectURL(audioObjectUrl);
+        audioObjectUrl = null;
+      }
+      lastRenderedAudioUrl = audioUrl || '';
       contentEl.innerHTML = 
         '<div class="player">' +
           '<button class="play-btn" id="playBtn">' +
@@ -291,6 +299,30 @@ function getPlayerHTML(botName: string): string {
       const toggleBtn = document.getElementById('toggleBtn');
       const textBubble = document.getElementById('textBubble');
 
+      function base64ToBlob(value) {
+        const binary = atob(value);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return new Blob([bytes], { type: 'audio/mpeg' });
+      }
+
+      async function prepareAudio() {
+        let blob;
+        if (audioBase64) {
+          blob = base64ToBlob(audioBase64);
+        } else {
+          const response = await fetch(audioUrl);
+          if (!response.ok) throw new Error('Audio request failed (' + response.status + ').');
+          blob = await response.blob();
+        }
+        if (!blob.size) throw new Error('The generated audio is empty.');
+        audioObjectUrl = URL.createObjectURL(blob);
+        audio.src = audioObjectUrl;
+        audio.load();
+      }
+
       function updateDuration() {
         if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
         durationEl.textContent = formatTime(audio.duration);
@@ -299,9 +331,22 @@ function getPlayerHTML(botName: string): string {
       audio.addEventListener('loadedmetadata', updateDuration);
       audio.addEventListener('durationchange', updateDuration);
       
-      playBtn.addEventListener('click', function() {
+      let audioLoadError = null;
+      const audioReady = prepareAudio().catch(function(error) {
+        audioLoadError = error;
+        durationEl.textContent = 'error';
+        durationEl.title = error instanceof Error ? error.message : String(error);
+      });
+
+      playBtn.addEventListener('click', async function() {
         if (audio.paused) {
-          audio.play();
+          try {
+            await audioReady;
+            if (audioLoadError) throw audioLoadError;
+            await audio.play();
+          } catch (error) {
+            showError('Voice playback failed: ' + (error instanceof Error ? error.message : String(error)));
+          }
         } else {
           audio.pause();
         }
@@ -332,10 +377,6 @@ function getPlayerHTML(botName: string): string {
         bars.forEach((b, i) => b.classList.toggle('active', i < activeCount));
       });
 
-      audio.src = audioUrl;
-      audio.load();
-      updateDuration();
-      
       toggleBtn.addEventListener('click', function() {
         const isShow = textBubble.classList.toggle('show');
         toggleBtn.classList.toggle('expanded', isShow);
@@ -359,10 +400,34 @@ function getPlayerHTML(botName: string): string {
     }
     
     function handleData(data) {
-      if (data.error) { showError(data.error); return; }
-      if (data.audio_url && data.text) {
-        renderPlayer(data.text, data.audio_url);
+      if (!data || typeof data !== 'object') return false;
+      if (data.structuredContent) {
+        const structured = data.structuredContent;
+        const audioBase64 = data._meta?.audio_base64;
+        if (audioBase64 && !structured.audio_base64) {
+          return handleData({ ...structured, audio_base64: audioBase64 });
+        }
+        return handleData(structured);
       }
+      if (data.error) { showError(data.error); return true; }
+      if (data.audio_url && data.text) {
+        if (data.audio_url !== lastRenderedAudioUrl) {
+          renderPlayer(data.text, data.audio_url, data.audio_base64);
+        }
+        return true;
+      }
+      return false;
+    }
+
+    function hydrateFromOpenAi(globals) {
+      const openai = window.openai;
+      const toolOutput = globals?.toolOutput ?? openai?.toolOutput;
+      if (handleData(toolOutput)) return true;
+
+      const metadata = globals?.toolResponseMetadata ?? openai?.toolResponseMetadata;
+      return handleData(metadata?.mcp_tool_result) ||
+        handleData(metadata?.call_tool_result) ||
+        handleData(metadata);
     }
     
     const pendingRequests = new Map();
@@ -394,13 +459,18 @@ function getPlayerHTML(botName: string): string {
       }
       
       if (msg.method === 'ui/notifications/tool-input') {
-        contentEl.innerHTML = '<div class="loading">Generating voice...</div>';
+        if (!lastRenderedAudioUrl) {
+          contentEl.innerHTML = '<div class="loading">Generating voice...</div>';
+        }
       }
       if (msg.method === 'ui/notifications/tool-result') {
-        const structured = msg.params?.structuredContent;
-        if (structured) handleData(structured);
+        handleData(msg.params);
       }
       if (msg.structuredContent) handleData(msg.structuredContent);
+    }, { passive: true });
+
+    window.addEventListener('openai:set_globals', function(event) {
+      hydrateFromOpenAi(event.detail?.globals);
     }, { passive: true });
     
     async function initializeBridge() {
@@ -411,11 +481,13 @@ function getPlayerHTML(botName: string): string {
           protocolVersion: '2026-01-26'
         });
         notifyHost('ui/notifications/initialized', {});
+        hydrateFromOpenAi();
       } catch (_error) {
         showError('Voice player failed to initialize.');
       }
     }
 
+    hydrateFromOpenAi();
     initializeBridge();
   </script>
 </body>
@@ -3043,8 +3115,8 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           structuredContent: {
             text: text,
             audio_url: new URL(`/audio/${event.id}.mp3`, origin).toString(),
-            audio_base64: result.audio_base64,
           },
+          _meta: { audio_base64: result.audio_base64 },
         };
       }
 
