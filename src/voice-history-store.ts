@@ -1,6 +1,6 @@
 import type { Env } from "./index";
 
-const INDEX_KEY = "recent-index-v1";
+const INDEX_KEY = "recent-index-v2-cattea-only";
 const RECENT_LIMIT = 12;
 const AUDIO_CHUNK_SIZE = 96_000;
 const FETCH_TIMEOUT_MS = 15_000;
@@ -12,6 +12,7 @@ export type GlobalVoiceEvent = {
   created_at: string;
   provider?: string;
   model_id?: string;
+  voice_id?: string;
   history_item_id?: string;
   caption_cues?: Array<{ text: string; start: number; end: number }>;
 };
@@ -92,7 +93,13 @@ export class VoiceHistoryStore {
 
   private async readIndex(): Promise<GlobalVoiceMeta[]> {
     const value = await this.state.storage.get<GlobalVoiceMeta[]>(INDEX_KEY);
-    return Array.isArray(value) ? value : [];
+    if (!Array.isArray(value)) return [];
+    const configuredVoiceIds = this.configuredVoiceIds();
+    if (!configuredVoiceIds.size) return [];
+    return value.filter((item) => {
+      if (item.provider !== "elevenlabs" || !item.id.startsWith("elevenlabs-")) return true;
+      return typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id);
+    });
   }
 
   private async writeIndex(events: GlobalVoiceMeta[]): Promise<void> {
@@ -111,6 +118,7 @@ export class VoiceHistoryStore {
       created_at: event.created_at,
       provider: event.provider,
       model_id: event.model_id,
+      voice_id: event.voice_id,
       history_item_id: event.history_item_id,
       caption_cues: event.caption_cues,
       audio_chunks: chunks.length,
@@ -128,6 +136,7 @@ export class VoiceHistoryStore {
       created_at: event.created_at,
       provider: event.provider,
       model_id: event.model_id,
+      voice_id: event.voice_id,
       history_item_id: event.history_item_id,
     };
     const createdAt = Date.parse(event.created_at);
@@ -157,7 +166,7 @@ export class VoiceHistoryStore {
       this.env.ELEVENLABS_VOICE_ID,
       this.env.ELEVENLABS_VOICE_ID_ZH,
       this.env.ELEVENLABS_VOICE_ID_EN,
-    ].filter((voiceId): voiceId is string => Boolean(voiceId)));
+    ].map((voiceId) => voiceId?.trim()).filter((voiceId): voiceId is string => Boolean(voiceId)));
   }
 
   private async syncHistory(): Promise<GlobalVoiceMeta[]> {
@@ -174,10 +183,9 @@ export class VoiceHistoryStore {
 
     const data = await response.json() as { history?: ElevenLabsHistoryItem[] };
     const configuredVoiceIds = this.configuredVoiceIds();
+    if (!configuredVoiceIds.size) throw new Error("CatTea ElevenLabs voice ID is unavailable");
     const history = Array.isArray(data.history) ? data.history : [];
-    const matching = configuredVoiceIds.size
-      ? history.filter((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id))
-      : history;
+    const matching = history.filter((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id));
     const events: GlobalVoiceMeta[] = matching
       .filter((item): item is ElevenLabsHistoryItem & { history_item_id: string } => (
         typeof item.history_item_id === "string" && isValidHistoryItemId(item.history_item_id)
@@ -190,6 +198,7 @@ export class VoiceHistoryStore {
           : new Date().toISOString(),
         provider: "elevenlabs",
         model_id: item.model_id || "eleven_v3",
+        voice_id: item.voice_id || undefined,
         history_item_id: item.history_item_id,
       }));
 
@@ -224,6 +233,11 @@ export class VoiceHistoryStore {
     if (!audioResponse.ok) throw new Error(`ElevenLabs audio returned ${audioResponse.status}`);
 
     const metadata = await metadataResponse.json() as ElevenLabsHistoryItem;
+    const configuredVoiceIds = this.configuredVoiceIds();
+    if (!configuredVoiceIds.size) throw new Error("CatTea ElevenLabs voice ID is unavailable");
+    if (typeof metadata.voice_id !== "string" || !configuredVoiceIds.has(metadata.voice_id)) {
+      throw new Error("History item belongs to a different ElevenLabs voice");
+    }
     const event: GlobalVoiceEvent = {
       id,
       text: getHistoryText(metadata, historyItemId),
@@ -233,6 +247,7 @@ export class VoiceHistoryStore {
         : new Date().toISOString(),
       provider: "elevenlabs",
       model_id: metadata.model_id || "eleven_v3",
+      voice_id: metadata.voice_id,
       history_item_id: metadata.history_item_id || historyItemId,
     };
     await this.putEvent(event);
@@ -243,7 +258,8 @@ export class VoiceHistoryStore {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/events" && request.method === "GET") {
-        return Response.json({ events: await this.readIndex() });
+        const events = await this.readIndex();
+        return Response.json({ events: events.length ? events : await this.syncHistory() });
       }
       if (url.pathname === "/event" && request.method === "PUT") {
         const event = await request.json<unknown>();
