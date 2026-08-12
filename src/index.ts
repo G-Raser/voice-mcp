@@ -113,8 +113,10 @@ const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://cattea-voice/player-v5.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
+const LATEST_HISTORY_SYNC_PATH = "/__voice-mcp/latest-history-sync";
 const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
 const AUDIO_REPLAY_PATH = "/audio/replay";
+const HISTORY_SYNC_INTERVAL_SECONDS = 8;
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
@@ -2853,7 +2855,11 @@ async function createForcedAlignment(env: Env, text: string, audioBuffer: ArrayB
   };
 }
 
-async function fetchElevenLabsHistoryEvent(env: Env, historyItemId: string): Promise<{ success: boolean; event?: VoiceEvent; error?: string }> {
+async function fetchElevenLabsHistoryEvent(
+  env: Env,
+  historyItemId: string,
+  options: { allowForcedAlignment?: boolean } = {},
+): Promise<{ success: boolean; event?: VoiceEvent; error?: string }> {
   try {
     const apiKey = env.ELEVENLABS_API_KEY;
 
@@ -2895,7 +2901,7 @@ async function fetchElevenLabsHistoryEvent(env: Env, historyItemId: string): Pro
     const text = getHistoryText(metadata, alignment, historyItemId);
     let captionCues = createCaptionCues(text, alignment);
 
-    if (!hasUsableCaptionCues(text, captionCues)) {
+    if (options.allowForcedAlignment !== false && !hasUsableCaptionCues(text, captionCues)) {
       const forcedText = stripAudioTags(text) || text;
       const forcedAlignment = await createForcedAlignment(env, forcedText, audioBuffer);
       captionCues = forcedAlignment ? createCaptionCues(forcedText, forcedAlignment) : [];
@@ -2908,7 +2914,7 @@ async function fetchElevenLabsHistoryEvent(env: Env, historyItemId: string): Pro
     return {
       success: true,
       event: {
-        id: crypto.randomUUID(),
+        id: `elevenlabs-${metadata.history_item_id || historyItemId}`,
         text,
         audio_base64: audioBase64,
         created_at: createdAt,
@@ -2989,6 +2995,10 @@ function getSpeakInputError(text: string): string | undefined {
 
 function getLatestVoiceCacheRequest(origin: string): Request {
   return new Request(new URL(LATEST_VOICE_CACHE_PATH, origin).toString(), { method: "GET" });
+}
+
+function getLatestHistorySyncRequest(origin: string): Request {
+  return new Request(new URL(LATEST_HISTORY_SYNC_PATH, origin).toString(), { method: "GET" });
 }
 
 function getVoiceEventCacheRequest(origin: string, id: string): Request {
@@ -3093,6 +3103,89 @@ async function readLatestVoiceEvent(origin: string): Promise<VoiceEvent | null> 
   const response = await caches.default.match(getLatestVoiceCacheRequest(origin));
   if (!response) return null;
   return await response.json<VoiceEvent>();
+}
+
+function getConfiguredElevenLabsVoiceIds(env: Env): Set<string> {
+  return new Set([
+    env.ELEVENLABS_VOICE_ID,
+    env.ELEVENLABS_VOICE_ID_ZH,
+    env.ELEVENLABS_VOICE_ID_EN,
+  ].filter((voiceId): voiceId is string => Boolean(voiceId)));
+}
+
+async function fetchLatestElevenLabsHistoryItem(env: Env): Promise<ElevenLabsHistoryItem | null> {
+  if (!env.ELEVENLABS_API_KEY) return null;
+
+  const historyUrl = new URL("https://api.elevenlabs.io/v1/history");
+  historyUrl.searchParams.set("page_size", "10");
+  historyUrl.searchParams.set("source", "TTS");
+  const response = await fetch(historyUrl.toString(), {
+    headers: {
+      "xi-api-key": env.ELEVENLABS_API_KEY,
+      "Accept": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    console.error("ElevenLabs history sync failed", response.status, await response.text());
+    return null;
+  }
+
+  const data = await response.json() as { history?: ElevenLabsHistoryItem[] };
+  const history = Array.isArray(data.history) ? data.history : [];
+  const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
+
+  return history.find((item) => {
+    if (!item.history_item_id || !isValidHistoryItemId(item.history_item_id)) return false;
+    return configuredVoiceIds.size === 0 || (typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id));
+  }) || null;
+}
+
+async function syncLatestElevenLabsHistoryEvent(
+  env: Env,
+  origin: string,
+  currentEvent: VoiceEvent | null,
+): Promise<VoiceEvent | null> {
+  if (getTtsProvider(env) !== "elevenlabs" || !env.ELEVENLABS_API_KEY) return currentEvent;
+
+  const syncRequest = getLatestHistorySyncRequest(origin);
+  if (await caches.default.match(syncRequest)) return currentEvent;
+
+  // Claim the regional sync slot before the API request so simultaneous panel polls do not fan out.
+  await caches.default.put(
+    syncRequest,
+    new Response("syncing", {
+      headers: { "Cache-Control": `public, max-age=${HISTORY_SYNC_INTERVAL_SECONDS}` },
+    }),
+  );
+
+  const latestItem = await fetchLatestElevenLabsHistoryItem(env);
+  const historyItemId = latestItem?.history_item_id;
+  if (!historyItemId || currentEvent?.history_item_id === historyItemId) return currentEvent;
+
+  const latestCreatedAt = typeof latestItem.date_unix === "number" && Number.isFinite(latestItem.date_unix)
+    ? latestItem.date_unix * 1000
+    : Number.NaN;
+  const currentCreatedAt = currentEvent ? Date.parse(currentEvent.created_at) : Number.NaN;
+
+  // Keep a freshly generated local event while ElevenLabs history is still catching up.
+  if (
+    currentEvent &&
+    Number.isFinite(latestCreatedAt) &&
+    Number.isFinite(currentCreatedAt) &&
+    latestCreatedAt + 30_000 < currentCreatedAt
+  ) {
+    return currentEvent;
+  }
+
+  const result = await fetchElevenLabsHistoryEvent(env, historyItemId, { allowForcedAlignment: false });
+  if (!result.success || !result.event) {
+    console.error("ElevenLabs latest history item unavailable", result.error || "Unknown error");
+    return currentEvent;
+  }
+
+  await storeLatestVoiceEvent(origin, result.event);
+  return result.event;
 }
 
 async function readVoiceEvent(origin: string, id: string): Promise<VoiceEvent | null> {
@@ -3301,7 +3394,8 @@ export default {
     }
 
     if (path === '/events/latest') {
-      const event = await readLatestVoiceEvent(url.origin);
+      const localEvent = await readLatestVoiceEvent(url.origin);
+      const event = await syncLatestElevenLabsHistoryEvent(env, url.origin, localEvent);
       if (!event || event.id === url.searchParams.get('since')) {
         return Response.json({ event: null }, {
           headers: {
