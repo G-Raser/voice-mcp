@@ -5,7 +5,7 @@ const DEFAULT_BOT_NAME = "CatTea";
 const RECENT_INDEX_PATH = "/__cattea/recent-index";
 const RECENT_EVENT_PREFIX = "/__cattea/recent-event/";
 const RECENT_LIMIT = 12;
-const RECENT_API_VERSION = "v15";
+const RECENT_API_VERSION = "v16";
 
 type VoiceEvent = {
   id: string;
@@ -14,6 +14,7 @@ type VoiceEvent = {
   created_at: string;
   provider?: string;
   model_id?: string;
+  voice_id?: string;
   [key: string]: unknown;
 };
 
@@ -23,6 +24,7 @@ type RecentVoiceMeta = {
   created_at: string;
   provider?: string;
   model_id?: string;
+  voice_id?: string;
   history_item_id?: string;
 };
 
@@ -162,6 +164,7 @@ async function appendRecentEvent(origin: string, event: VoiceEvent): Promise<voi
     created_at: event.created_at || new Date().toISOString(),
     provider: event.provider,
     model_id: event.model_id,
+    voice_id: typeof event.voice_id === "string" ? event.voice_id : undefined,
     history_item_id: typeof event.history_item_id === "string" ? event.history_item_id : undefined,
   };
   const next = [meta, ...current.filter((item) => item.id !== meta.id)].slice(0, RECENT_LIMIT);
@@ -194,7 +197,7 @@ function getConfiguredElevenLabsVoiceIds(env: Env): Set<string> {
     env.ELEVENLABS_VOICE_ID,
     env.ELEVENLABS_VOICE_ID_ZH,
     env.ELEVENLABS_VOICE_ID_EN,
-  ].filter((voiceId): voiceId is string => Boolean(voiceId)));
+  ].map((voiceId) => voiceId?.trim()).filter((voiceId): voiceId is string => Boolean(voiceId)));
 }
 
 function isValidHistoryItemId(value: string): boolean {
@@ -225,9 +228,12 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<HistoryFetchResult
     const data = await response.json() as { history?: ElevenLabsHistoryItem[] };
     const history = Array.isArray(data.history) ? data.history : [];
     const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
-    const matchingHistory = configuredVoiceIds.size
-      ? history.filter((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id))
-      : history;
+    if (!configuredVoiceIds.size) {
+      return { events: [], ok: false, detail: "CatTea ElevenLabs voice ID is unavailable" };
+    }
+    const matchingHistory = history.filter((item) => (
+      typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id)
+    ));
 
     const events = matchingHistory
       .filter((item): item is ElevenLabsHistoryItem & { history_item_id: string } => (
@@ -241,6 +247,7 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<HistoryFetchResult
           : new Date().toISOString(),
         provider: "elevenlabs",
         model_id: item.model_id || "eleven_v3",
+        voice_id: item.voice_id || undefined,
         history_item_id: item.history_item_id,
       }));
     return { events, ok: true };
@@ -254,8 +261,18 @@ async function fetchRecentElevenLabsVoices(env: Env): Promise<HistoryFetchResult
   }
 }
 
-function mergeRecentVoices(cached: RecentVoiceMeta[], history: RecentVoiceMeta[]): RecentVoiceMeta[] {
-  const enrichedCached = cached.map((item) => {
+function mergeRecentVoices(cached: RecentVoiceMeta[], history: RecentVoiceMeta[], env: Env): RecentVoiceMeta[] {
+  const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
+  const allowedHistoryIds = new Set(history.map((item) => item.history_item_id).filter(Boolean));
+  const catTeaCached = cached.filter((item) => {
+    if (item.provider !== "elevenlabs") return true;
+    if (item.voice_id) return configuredVoiceIds.has(item.voice_id);
+    if (item.id.startsWith("elevenlabs-")) {
+      return Boolean(item.history_item_id && allowedHistoryIds.has(item.history_item_id));
+    }
+    return true;
+  });
+  const enrichedCached = catTeaCached.map((item) => {
     if (item.history_item_id) return item;
     const createdAt = Date.parse(item.created_at);
     const match = history.find((historyItem) => (
@@ -528,7 +545,7 @@ function recentPanelAddon(): string {
   backdrop.innerHTML = ` + "`" + `
     <section class="cattea-history-modal" role="dialog" aria-modal="true" aria-labelledby="catteaHistoryTitle">
       <div class="cattea-history-head">
-        <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices · global v15</div>
+        <div class="cattea-history-title" id="catteaHistoryTitle">Recent voices · CatTea only · v16</div>
         <div class="cattea-history-actions">
           <button class="cattea-history-sync" id="catteaHistorySync" type="button">Sync</button>
           <button class="cattea-history-close" id="catteaHistoryClose" type="button" aria-label="Close history">×</button>
@@ -738,7 +755,7 @@ async function handleRecentEvents(
     ]);
     const historyResult = globalResult.ok ? globalResult : await fetchRecentElevenLabsVoices(env);
     return Response.json({
-      events: mergeRecentVoices(cached, historyResult.events),
+      events: mergeRecentVoices(cached, historyResult.events, env),
       sync: {
         ok: historyResult.ok,
         history_count: historyResult.events.length,
@@ -781,7 +798,7 @@ async function handleRecentSync(request: Request, origin: string, env: Env): Pro
   const globalResult = await syncGlobalRecentVoices(env);
   const historyResult = globalResult.ok ? globalResult : await fetchRecentElevenLabsVoices(env);
   const cached = await readRecentIndex(origin);
-  const events = mergeRecentVoices(cached, historyResult.events);
+  const events = mergeRecentVoices(cached, historyResult.events, env);
   const colo = request.cf?.colo || "unknown";
 
   if (!historyResult.ok) {
@@ -940,7 +957,7 @@ export default {
     let response = await worker.fetch(request, env, ctx);
     const contentType = response.headers.get("Content-Type") || "";
 
-    if ((path === "/panel" || path === "/panel-v13" || path === "/panel-v14" || path === "/panel-v15") && contentType.includes("text/html")) {
+    if ((path === "/panel" || path === "/panel-v13" || path === "/panel-v14" || path === "/panel-v15" || path === "/panel-v16") && contentType.includes("text/html")) {
       const personalizedHtml = personalizePanelHtml(await response.text());
       return new Response(personalizedHtml, {
         status: response.status,
