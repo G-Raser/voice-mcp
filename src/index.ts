@@ -78,6 +78,7 @@ interface VoiceEvent {
   created_at: string;
   provider: TtsProvider;
   model_id: string;
+  voice_id?: string;
   history_item_id?: string;
   caption_cues?: CaptionCue[];
   style?: string;
@@ -494,6 +495,7 @@ function getPlayerHTML(botName: string, origin: string): string {
           created_at: data.created_at,
           provider: data.provider,
           model_id: data.model_id,
+          voice_id: data.voice_id,
           history_item_id: data.history_item_id,
           audio_url: data.audio_url,
           audio_request: data.audio_request
@@ -516,6 +518,7 @@ function getPlayerHTML(botName: string, origin: string): string {
         created_at: data.created_at,
         provider: data.provider,
         model_id: data.model_id,
+        voice_id: data.voice_id,
         history_item_id: data.history_item_id
       })).catch(function() {
         lastPersistedEventId = '';
@@ -532,6 +535,7 @@ function getPlayerHTML(botName: string, origin: string): string {
         created_at: event.created_at,
         provider: event.provider,
         model_id: event.model_id,
+        voice_id: event.voice_id,
         history_item_id: event.history_item_id
       };
     }
@@ -3089,6 +3093,13 @@ async function fetchElevenLabsHistoryEvent(
     }
 
     const metadata = await metadataResponse.json() as ElevenLabsHistoryItem;
+    const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
+    if (!configuredVoiceIds.size) {
+      return { success: false, error: "CatTea ElevenLabs voice ID is unavailable" };
+    }
+    if (typeof metadata.voice_id !== "string" || !configuredVoiceIds.has(metadata.voice_id)) {
+      return { success: false, error: "History item belongs to a different ElevenLabs voice" };
+    }
     const audioResponse = await fetch(`${historyUrl}/audio`, {
       headers: {
         "xi-api-key": apiKey,
@@ -3125,6 +3136,7 @@ async function fetchElevenLabsHistoryEvent(
         created_at: createdAt,
         provider: "elevenlabs",
         model_id: metadata.model_id || getElevenLabsModel(env),
+        voice_id: metadata.voice_id,
         history_item_id: metadata.history_item_id || historyItemId,
         caption_cues: captionCues.length ? captionCues : undefined,
       },
@@ -3270,6 +3282,7 @@ async function createAudioReplayUrl(env: Env, origin: string, input: SpeakInput)
 
 function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): VoiceEvent {
   const provider = getTtsProvider(env);
+  const voiceId = provider === "elevenlabs" ? resolveElevenLabsVoice(env, input).voiceId : undefined;
   const finalText = result.final_text || input.text;
   const alignment = result.alignment || result.normalized_alignment;
   const captionCues = createCaptionCues(finalText, alignment);
@@ -3281,6 +3294,7 @@ function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): Voi
     created_at: new Date().toISOString(),
     provider,
     model_id: provider === "elevenlabs" ? getElevenLabsModel(env) : getDashScopeModel(env),
+    voice_id: voiceId,
     history_item_id: result.history_item_id,
     caption_cues: captionCues.length ? captionCues : undefined,
     style: input.style,
@@ -3316,7 +3330,7 @@ function getConfiguredElevenLabsVoiceIds(env: Env): Set<string> {
     env.ELEVENLABS_VOICE_ID,
     env.ELEVENLABS_VOICE_ID_ZH,
     env.ELEVENLABS_VOICE_ID_EN,
-  ].filter((voiceId): voiceId is string => Boolean(voiceId)));
+  ].map((voiceId) => voiceId?.trim()).filter((voiceId): voiceId is string => Boolean(voiceId)));
 }
 
 async function fetchLatestElevenLabsHistoryItem(env: Env): Promise<ElevenLabsHistoryItem | null> {
@@ -3339,11 +3353,10 @@ async function fetchLatestElevenLabsHistoryItem(env: Env): Promise<ElevenLabsHis
   const data = await response.json() as { history?: ElevenLabsHistoryItem[] };
   const history = Array.isArray(data.history) ? data.history : [];
   const configuredVoiceIds = getConfiguredElevenLabsVoiceIds(env);
+  if (!configuredVoiceIds.size) return null;
 
   const validHistory = history.filter((item) => item.history_item_id && isValidHistoryItemId(item.history_item_id));
-  return validHistory.find((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id))
-    || validHistory[0]
-    || null;
+  return validHistory.find((item) => typeof item.voice_id === "string" && configuredVoiceIds.has(item.voice_id)) || null;
 }
 
 async function syncLatestElevenLabsHistoryEvent(
@@ -3542,6 +3555,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
             created_at: event.created_at,
             provider: event.provider,
             model_id: event.model_id,
+            voice_id: event.voice_id,
             history_item_id: event.history_item_id,
           },
           _meta: { audio_base64: result.audio_base64 },
@@ -3592,7 +3606,7 @@ export default {
       return handler(request, env, ctx);
     }
 
-    if (path === '/panel' || path === '/panel-v13' || path === '/panel-v14' || path === '/panel-v15') {
+    if (path === '/panel' || path === '/panel-v13' || path === '/panel-v14' || path === '/panel-v15' || path === '/panel-v16') {
       const botName = env.BOT_NAME || 'Haven';
       return new Response(getVisualizerPanelHTML(botName), {
         headers: {
@@ -3674,6 +3688,7 @@ export default {
           created_at: typeof body.created_at === 'string' ? body.created_at : new Date().toISOString(),
           provider: body.provider === 'dashscope' ? 'dashscope' : 'elevenlabs',
           model_id: typeof body.model_id === 'string' ? body.model_id : getElevenLabsModel(env),
+          voice_id: typeof body.voice_id === 'string' ? body.voice_id : undefined,
           history_item_id: typeof body.history_item_id === 'string' ? body.history_item_id : undefined,
         };
         await storeLatestVoiceEvent(url.origin, event);
