@@ -1841,6 +1841,8 @@ function getVisualizerPanelHTML(botName: string): string {
     let objectUrl = '';
     let downloadName = 'haven-voice.mp3';
     let lastEventId = '';
+    let latestEventId = '';
+    let manualVoicePinnedAt = 0;
     let dockHidden = false;
     let captionLines = [];
     let captionCues = [];
@@ -2084,7 +2086,12 @@ function getVisualizerPanelHTML(botName: string): string {
           throw new Error(data.error || 'History item unavailable');
         }
 
-        receiveVoiceEvent(data.event);
+        // Keep a manually recovered history clip selected. The background
+        // poller may still know about a newer *old* clip, but it must not
+        // replace the user's selection. A genuinely new voice generated
+        // after this load is allowed to take over again.
+        manualVoicePinnedAt = Date.now();
+        receiveVoiceEvent(data.event, 'manual');
       } catch (error) {
         receiverText.textContent = 'history load failed';
         setMessage(error instanceof Error ? error.message : String(error), true);
@@ -2093,8 +2100,21 @@ function getVisualizerPanelHTML(botName: string): string {
       }
     }
 
-    function receiveVoiceEvent(event) {
-      if (!event || event.id === lastEventId || !event.audio_base64) return;
+    function receiveVoiceEvent(event, source = 'live') {
+      if (!event || !event.audio_base64) return;
+
+      if (source === 'live') {
+        if (event.id === latestEventId) return;
+        latestEventId = event.id;
+
+        if (manualVoicePinnedAt) {
+          const eventCreatedAt = Date.parse(event.created_at || '');
+          if (!Number.isFinite(eventCreatedAt) || eventCreatedAt <= manualVoicePinnedAt) return;
+          manualVoicePinnedAt = 0;
+        }
+      }
+
+      if (event.id === lastEventId) return;
       lastEventId = event.id;
 
       if (objectUrl) {
@@ -2125,11 +2145,11 @@ function getVisualizerPanelHTML(botName: string): string {
     async function pollLatestVoiceEvent() {
       try {
         const latestUrl = new URL('/events/latest', window.location.origin);
-        if (lastEventId) latestUrl.searchParams.set('since', lastEventId);
+        if (latestEventId) latestUrl.searchParams.set('since', latestEventId);
         const response = await fetch(latestUrl.toString(), { cache: 'no-store' });
         if (!response.ok) throw new Error('Voice event stream unavailable');
         const data = await response.json();
-        if (data.event) receiveVoiceEvent(data.event);
+        if (data.event) receiveVoiceEvent(data.event, 'live');
         else if (!lastEventId) {
           receiverText.textContent = 'waiting for MCP voice';
           eventTime.textContent = 'no signal';
@@ -3525,7 +3545,7 @@ export default {
       return handler(request, env, ctx);
     }
 
-    if (path === '/panel') {
+    if (path === '/panel' || path === '/panel-v13') {
       const botName = env.BOT_NAME || 'Haven';
       return new Response(getVisualizerPanelHTML(botName), {
         headers: {
