@@ -103,8 +103,11 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v2.html";
-const LEGACY_VOICE_RESOURCE_URIS = ["ui://voice-mcp/player.html"] as const;
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v3.html";
+const LEGACY_VOICE_RESOURCE_URIS = [
+  "ui://voice-mcp/player.html",
+  "ui://cattea-voice/player-v2.html",
+] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const VOICE_EVENT_CACHE_PREFIX = "/__voice-mcp/voice-event/";
 
@@ -362,30 +365,58 @@ function getPlayerHTML(botName: string): string {
       }
     }
     
-    function sendToHost(method, params, id) {
-      const msg = { jsonrpc: '2.0', method: method, params: params || {} };
-      if (id !== undefined) msg.id = id;
-      window.parent.postMessage(msg, '*');
+    const pendingRequests = new Map();
+    let nextRequestId = 1;
+
+    function requestHost(method, params) {
+      const id = nextRequestId++;
+      window.parent.postMessage({ jsonrpc: '2.0', id, method, params: params || {} }, '*');
+      return new Promise(function(resolve, reject) {
+        pendingRequests.set(id, { resolve: resolve, reject: reject });
+      });
+    }
+
+    function notifyHost(method, params) {
+      window.parent.postMessage({ jsonrpc: '2.0', method: method, params: params || {} }, '*');
     }
     
     window.addEventListener('message', function(event) {
+      if (event.source !== window.parent) return;
       const msg = event.data;
-      if (!msg || typeof msg !== 'object') return;
+      if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') return;
+
+      if (msg.id !== undefined && pendingRequests.has(msg.id)) {
+        const pending = pendingRequests.get(msg.id);
+        pendingRequests.delete(msg.id);
+        if (msg.error) pending.reject(msg.error);
+        else pending.resolve(msg.result);
+        return;
+      }
       
-      if (msg.jsonrpc === '2.0') {
-        if (msg.method === 'ui/notifications/tool-input') {
-          contentEl.innerHTML = '<div class="loading">Generating voice...</div>';
-        }
-        if (msg.method === 'ui/notifications/tool-result') {
-          const structured = msg.params?.structuredContent;
-          if (structured) handleData(structured);
-        }
+      if (msg.method === 'ui/notifications/tool-input') {
+        contentEl.innerHTML = '<div class="loading">Generating voice...</div>';
+      }
+      if (msg.method === 'ui/notifications/tool-result') {
+        const structured = msg.params?.structuredContent;
+        if (structured) handleData(structured);
       }
       if (msg.structuredContent) handleData(msg.structuredContent);
-    });
+    }, { passive: true });
     
-    sendToHost('ui/initialize', { name: 'voice-mcp', version: '1.0.0' }, 1);
-    setTimeout(function() { sendToHost('ui/notifications/initialized', {}); }, 50);
+    async function initializeBridge() {
+      try {
+        await requestHost('ui/initialize', {
+          appInfo: { name: 'voice-mcp', version: '1.0.0' },
+          appCapabilities: {},
+          protocolVersion: '2026-01-26'
+        });
+        notifyHost('ui/notifications/initialized', {});
+      } catch (_error) {
+        showError('Voice player failed to initialize.');
+      }
+    }
+
+    initializeBridge();
   </script>
 </body>
 </html>`;
