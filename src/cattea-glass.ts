@@ -2,6 +2,8 @@ import worker from "./cattea";
 import type { Env } from "./index";
 export { VoiceHistoryStore } from "./voice-history-store";
 
+const CATTEA_ACCENT = "#A67DF3";
+
 const HISTORY_GLASS_STYLE = `
 <style id="catteaHistoryGlassTheme">
   .cattea-history-backdrop {
@@ -37,11 +39,26 @@ const HISTORY_GLASS_STYLE = `
   }
 </style>`;
 
+function applyCatTeaAccent(body: string): string {
+  return body
+    .replaceAll("#07c160", CATTEA_ACCENT)
+    .replaceAll("#4cd964", CATTEA_ACCENT);
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const response = await worker.fetch(request, env, ctx);
     const path = new URL(request.url).pathname;
     const contentType = response.headers.get("Content-Type") || "";
+
+    if (path === "/mcp" && (contentType.includes("json") || contentType.includes("text/"))) {
+      const body = applyCatTeaAccent(await response.text());
+      return new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }
 
     if (!["/panel", "/panel-v13", "/panel-v14", "/panel-v15", "/panel-v16"].includes(path) || !contentType.includes("text/html")) {
       return response;
