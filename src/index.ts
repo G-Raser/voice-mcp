@@ -107,7 +107,7 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v9.html";
+const VOICE_RESOURCE_URI = "ui://cattea-voice/player-v8.html";
 const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://voice-mcp/player.html",
   "ui://cattea-voice/player-v2.html",
@@ -116,7 +116,6 @@ const LEGACY_VOICE_RESOURCE_URIS = [
   "ui://cattea-voice/player-v5.html",
   "ui://cattea-voice/player-v6.html",
   "ui://cattea-voice/player-v7.html",
-  "ui://cattea-voice/player-v8.html",
 ] as const;
 const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
 const LATEST_HISTORY_SYNC_PATH = "/__voice-mcp/latest-history-sync";
@@ -171,7 +170,7 @@ function getPlayerHTML(botName: string, origin: string): string {
     .play-btn:hover { background: #eee; }
     .play-btn:active { background: #e0e0e0; }
     .play-btn svg { width: 14px; height: 14px; fill: #333; }
-    .play-btn.playing svg { fill: #A67DF3; }
+    .play-btn.playing svg { fill: #07c160; }
     .waveform {
       flex: 1;
       display: flex;
@@ -185,7 +184,7 @@ function getPlayerHTML(botName: string, origin: string): string {
       border-radius: 2px;
       transition: background 0.1s;
     }
-    .wave-bar.active { background: #A67DF3; }
+    .wave-bar.active { background: #07c160; }
     .duration {
       font-size: 13px;
       color: #999;
@@ -195,7 +194,7 @@ function getPlayerHTML(botName: string, origin: string): string {
     .toggle-btn {
       background: none;
       border: none;
-      color: #A67DF3;
+      color: #07c160;
       font-size: 12px;
       cursor: pointer;
       padding: 8px 0 4px 0;
@@ -239,10 +238,10 @@ function getPlayerHTML(botName: string, origin: string): string {
       .play-btn { background: #3a3a3a; }
       .play-btn svg { fill: #e0e0e0; }
       .wave-bar { background: #555; }
-      .wave-bar.active { background: #A67DF3; }
+      .wave-bar.active { background: #4cd964; }
       .duration { color: #888; }
       .text-bubble { background: #3a3a3a; color: #e0e0e0; }
-      .toggle-btn { color: #A67DF3; }
+      .toggle-btn { color: #4cd964; }
     }
   </style>
 </head>
