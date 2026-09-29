@@ -36,6 +36,7 @@ export interface Env {
   ELEVENLABS_USE_SPEAKER_BOOST?: string;
   ELEVENLABS_SPEED?: string;
   AUDIO_URL_SIGNING_KEY?: string;
+  CATTEA_PWA_VOICE_OVERRIDE_TOKEN?: string;
   BOT_NAME?: string;
   VOICE_HISTORY?: DurableObjectNamespace;
 }
@@ -47,10 +48,17 @@ interface SpeakInput {
   text: string;
   style?: string;
   raw_tags?: boolean;
+  // Request-scoped overrides are accepted only from the authenticated PWA route.
+  model_id?: string;
+  language_code?: "auto" | "en" | "zh";
+  stability?: number;
+  similarity_boost?: number;
 }
 
 interface AudioResult {
   success: boolean;
+  model_id?: string;
+  voice_id?: string;
   audio_base64?: string;
   history_item_id?: string;
   alignment?: ElevenLabsAlignment;
@@ -2470,8 +2478,12 @@ function getDashScopeModel(env: Env): string {
   return env.TTS_MODEL || "cosyvoice-v3.5-plus";
 }
 
-function getElevenLabsModel(env: Env): string {
-  return env.ELEVENLABS_MODEL_ID || "eleven_v3";
+function getElevenLabsModel(env: Env, input?: SpeakInput): string {
+  return input?.model_id || env.ELEVENLABS_MODEL_ID || "eleven_v3";
+}
+
+function isElevenV4(modelId: string): boolean {
+  return modelId === "eleven_v4" || modelId === "eleven_v4_turbo";
 }
 
 function getElevenLabsOutputFormat(env: Env): string {
@@ -2489,7 +2501,8 @@ function detectElevenLabsLanguage(text: string): ElevenLabsLanguage {
 }
 
 function resolveElevenLabsVoice(env: Env, input: SpeakInput): ElevenLabsVoiceSelection {
-  const language = detectElevenLabsLanguage(input.text);
+  const language = input.language_code && input.language_code !== "auto"
+    ? input.language_code : detectElevenLabsLanguage(input.text);
   const voiceId = language === "zh"
     ? env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID
     : env.ELEVENLABS_VOICE_ID_EN || env.ELEVENLABS_VOICE_ID;
@@ -2497,7 +2510,7 @@ function resolveElevenLabsVoice(env: Env, input: SpeakInput): ElevenLabsVoiceSel
     ? env.ELEVENLABS_LANGUAGE_CODE_ZH || (env.ELEVENLABS_VOICE_ID_ZH ? "zh" : getElevenLabsLanguageCode(env))
     : env.ELEVENLABS_LANGUAGE_CODE_EN || (env.ELEVENLABS_VOICE_ID_EN ? "en" : getElevenLabsLanguageCode(env));
 
-  return { voiceId, language, languageCode };
+  return { voiceId, language, languageCode: input.language_code === "auto" ? undefined : input.language_code || languageCode };
 }
 
 function parseOptionalNumber(value: string | undefined): number | undefined {
@@ -2514,7 +2527,12 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
-function getElevenLabsVoiceSettings(env: Env): Record<string, number | boolean> {
+function getElevenLabsVoiceSettings(env: Env, input: SpeakInput, modelId: string): Record<string, number | boolean> {
+  if (isElevenV4(modelId)) {
+    return input.stability !== undefined && input.similarity_boost !== undefined
+      ? { stability: input.stability, similarity_boost: input.similarity_boost }
+      : {};
+  }
   const settings: Record<string, number | boolean> = {};
   const stability = parseOptionalNumber(env.ELEVENLABS_STABILITY);
   const similarityBoost = parseOptionalNumber(env.ELEVENLABS_SIMILARITY_BOOST);
@@ -2528,12 +2546,14 @@ function getElevenLabsVoiceSettings(env: Env): Record<string, number | boolean> 
   if (useSpeakerBoost !== undefined) settings.use_speaker_boost = useSpeakerBoost;
   if (speed !== undefined) settings.speed = speed;
 
+  if (input.stability !== undefined) settings.stability = input.stability;
+  if (input.similarity_boost !== undefined) settings.similarity_boost = input.similarity_boost;
   return settings;
 }
 
 function stripAudioTags(text: string): string {
   return text
-    .replace(/\[[A-Za-z][A-Za-z _-]*\]/g, "")
+    .replace(/\[[^\[\]\n]{1,400}\]/g, "")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\s+([,.!?，。！？])/g, "$1")
     .trim();
@@ -2807,8 +2827,12 @@ function addElevenLabsTrailingPause(text: string, useV3Pacing = false): string {
 }
 
 function buildElevenLabsText(env: Env, input: SpeakInput): string {
-  const modelId = getElevenLabsModel(env);
+  const modelId = getElevenLabsModel(env, input);
 
+  if (isElevenV4(modelId)) {
+    // v4 accepts natural-language Audio Tags, including composite tags.
+    return input.raw_tags === false ? stripAudioTags(input.text) : input.text.trim();
+  }
   if (modelId !== "eleven_v3") {
     return addElevenLabsTrailingPause(stripAudioTags(input.text));
   }
@@ -2911,23 +2935,21 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
       return { success: false, error: "ELEVENLABS_VOICE_ID is not configured" };
     }
 
-    const modelId = getElevenLabsModel(env);
+    const modelId = getElevenLabsModel(env, input);
     const outputFormat = getElevenLabsOutputFormat(env);
     const finalText = buildElevenLabsText(env, input);
-    const voiceSettings = getElevenLabsVoiceSettings(env);
-    console.log("ElevenLabs TTS request", JSON.stringify({
-      model_id: modelId,
-      text: finalText,
-    }));
-
-    const requestUrl = new URL(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`);
+    const voiceSettings = getElevenLabsVoiceSettings(env, input, modelId);
+    // The v4 dialogue API uses inputs/settings, while the v3 endpoint uses text/voice_settings.
+    const requestUrl = new URL(isElevenV4(modelId)
+      ? "https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps"
+      : `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`);
     requestUrl.searchParams.set("output_format", outputFormat);
-    const requestBody: Record<string, unknown> = {
-      text: finalText,
-      model_id: modelId,
-      voice_settings: voiceSettings,
-    };
-
+    const requestBody: Record<string, unknown> = isElevenV4(modelId)
+      ? { inputs: [{ text: finalText, voice_id: voiceSelection.voiceId }], model_id: modelId }
+      : { text: finalText, model_id: modelId, voice_settings: voiceSettings };
+    if (isElevenV4(modelId) && Object.keys(voiceSettings).length) {
+      requestBody.settings = voiceSettings;
+    }
     if (voiceSelection.languageCode) {
       requestBody.language_code = voiceSelection.languageCode;
     }
@@ -2964,6 +2986,8 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
         || response.headers.get("history-item-id")
         || response.headers.get("x-history-item-id")
         || undefined,
+      model_id: modelId,
+      voice_id: voiceSelection.voiceId,
       alignment: data.alignment,
       normalized_alignment: data.normalized_alignment,
       final_text: finalText,
@@ -3167,14 +3191,19 @@ function getTtsStatus(env: Env): Record<string, unknown> {
       configured: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID || env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN)),
       configured_zh: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID)),
       configured_en: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_EN || env.ELEVENLABS_VOICE_ID)),
-      audio_tags_enabled: modelId === "eleven_v3",
+      audio_tags_enabled: modelId === "eleven_v3" || isElevenV4(modelId),
+      request_overrides: {
+        model_id: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN),
+        language_code: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN),
+        voice_settings: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN),
+      },
       language_mode: env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN ? "auto" : "single",
       language_code: getElevenLabsLanguageCode(env) || "",
       language_codes: {
         zh: env.ELEVENLABS_LANGUAGE_CODE_ZH || (env.ELEVENLABS_VOICE_ID_ZH ? "zh" : ""),
         en: env.ELEVENLABS_LANGUAGE_CODE_EN || (env.ELEVENLABS_VOICE_ID_EN ? "en" : ""),
       },
-      voice_settings: getElevenLabsVoiceSettings(env),
+      voice_settings: getElevenLabsVoiceSettings(env, { text: '' }, modelId),
     };
   }
 
@@ -3293,8 +3322,8 @@ function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): Voi
     audio_base64: result.audio_base64 || "",
     created_at: new Date().toISOString(),
     provider,
-    model_id: provider === "elevenlabs" ? getElevenLabsModel(env) : getDashScopeModel(env),
-    voice_id: voiceId,
+    model_id: provider === "elevenlabs" ? result.model_id || getElevenLabsModel(env, input) : getDashScopeModel(env),
+    voice_id: result.voice_id || voiceId,
     history_item_id: result.history_item_id,
     caption_cues: captionCues.length ? captionCues : undefined,
     style: input.style,
@@ -3576,6 +3605,48 @@ function createVoiceServer(env: Env, origin: string): McpServer {
   return server;
 }
 
+// Only authenticated server-to-server /speak requests may override the default model.
+// The public MCP speak tool and unsigned legacy requests preserve the existing defaults.
+const SPEAK_OVERRIDE_KEYS = ["model_id", "language_code", "stability", "similarity_boost"] as const;
+
+function parseSpeakOverrides(
+  data: Record<string, unknown>,
+): { overrides?: Partial<SpeakInput>; error?: string } {
+  const provided = SPEAK_OVERRIDE_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(data, key));
+  if (!provided.length) return { overrides: undefined };
+  const model = data.model_id;
+  const language = data.language_code;
+  if (typeof model !== "string" || !["eleven_v3", "eleven_v4", "eleven_v4_turbo"].includes(model)) {
+    return { error: "Unsupported model_id" };
+  }
+  if (language !== "auto" && language !== "en" && language !== "zh") {
+    return { error: "Unsupported language_code" };
+  }
+  if (model === "eleven_v3" && language !== "en") {
+    return { error: "The v3 PWA route remains English-only" };
+  }
+  const hasStability = provided.includes("stability");
+  const hasSimilarity = provided.includes("similarity_boost");
+  if (hasStability !== hasSimilarity) return { error: "Both voice settings must be provided together" };
+  const overrides: Partial<SpeakInput> = { model_id: model, language_code: language };
+  if (hasStability && hasSimilarity) {
+    const validate = (value: unknown): number | null => {
+      if (typeof value === "number") return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+      if (typeof value === "string" && /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(value)) {
+        const number = Number(value);
+        return Number.isFinite(number) && number >= 0 && number <= 1 ? number : null;
+      }
+      return null;
+    };
+    const stability = validate(data.stability);
+    const similarity = validate(data.similarity_boost);
+    if (stability === null || similarity === null) return { error: "Voice settings must be numbers from 0 to 1" };
+    overrides.stability = stability;
+    overrides.similarity_boost = similarity;
+  }
+  return { overrides };
+}
+
 // =============================================================================
 // Worker Handler
 // =============================================================================
@@ -3583,7 +3654,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-CatTea-Voice-Token',
 };
 
 export default {
@@ -3812,10 +3883,14 @@ export default {
       let textValue = "";
       let style: string | undefined;
       let rawTags: boolean | undefined;
+      let overrideFields: Record<string, unknown> = {};
       if (request.method === 'GET') {
         textValue = url.searchParams.get('text') || "";
         style = url.searchParams.get('style') || undefined;
         rawTags = parseRawTags(url.searchParams.get('raw_tags'));
+        for (const key of SPEAK_OVERRIDE_KEYS) {
+          if (url.searchParams.has(key)) overrideFields[key] = url.searchParams.get(key);
+        }
       } else {
         let body: unknown;
         try {
@@ -3836,6 +3911,7 @@ export default {
         textValue = typeof payload.text === 'string' ? payload.text : "";
         style = typeof payload.style === 'string' ? payload.style : undefined;
         rawTags = typeof payload.raw_tags === 'boolean' ? payload.raw_tags : undefined;
+        overrideFields = Object.fromEntries(SPEAK_OVERRIDE_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(payload, key)).map((key) => [key, payload[key]]));
       }
       const inputError = getSpeakInputError(textValue);
       if (inputError) {
@@ -3845,10 +3921,28 @@ export default {
         });
       }
 
+      const hasOverrides = SPEAK_OVERRIDE_KEYS.some((key) => Object.prototype.hasOwnProperty.call(overrideFields, key));
+      if (hasOverrides) {
+        const providedToken = request.headers.get('X-CatTea-Voice-Token') || '';
+        const expectedToken = env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN || '';
+        if (!expectedToken || !signaturesMatch(providedToken, expectedToken)) {
+          return Response.json({ error: 'Authenticated PWA voice override required' }, {
+            status: 403, headers: { ...corsHeaders, 'Cache-Control': 'no-store' },
+          });
+        }
+        if (getTtsProvider(env) !== 'elevenlabs') {
+          return Response.json({ error: 'Model overrides require ElevenLabs' }, { status: 400, headers: corsHeaders });
+        }
+      }
+      const parsed = parseSpeakOverrides(overrideFields);
+      if (parsed.error) {
+        return Response.json({ error: parsed.error }, { status: 400, headers: corsHeaders });
+      }
       const input = normalizeSpeakInput({
         text: textValue,
         style,
         raw_tags: rawTags,
+        ...parsed.overrides,
       });
       const result = await generateAudio(env, input);
 
