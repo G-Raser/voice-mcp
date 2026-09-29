@@ -166,6 +166,15 @@ speak(text: string, style?: string, raw_tags?: boolean)
 
 Existing `speak(text)` calls remain compatible.
 
+For trusted server-side clients, per-request ElevenLabs model overrides are available
+when `CATTEA_PWA_VOICE_OVERRIDE_TOKEN` is configured as a Worker secret. Send the
+same token in the `X-CatTea-Voice-Token` header on `/status` and `/speak`.
+Authenticated `/speak` requests may set `model_id` (`eleven_v3`, `eleven_v4`,
+`eleven_v4_turbo`), `language_code` (`auto`, `en`, `zh`), and paired `stability`
+and `similarity_boost` values between 0 and 1. The v4 models use Text to
+Dialogue with timestamps; unsigned requests retain the configured default.
+Keep the token on a trusted backend, never in browser-side code.
+
 When the MCP `speak` tool succeeds, the Worker stores the latest voice event for
 `/panel`. Keep `/panel` open while using `speak`; when a new voice arrives, the
 visualizer loads it and enables playback.
