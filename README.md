@@ -104,7 +104,7 @@ npx wrangler secret put ELEVENLABS_STYLE          # Example: 0.85
 npx wrangler secret put ELEVENLABS_SPEED          # Example: 1.20
 ```
 
-`eleven_v3` supports audio tags such as `[whispers]`, `[sighs]`, and `[laughs]`.
+`eleven_v3` and `eleven_v4` support audio tags such as `[whispers]`, `[sighs]`, and `[laughs]`.
 `eleven_multilingual_v2` is a steadier choice for ordinary reading.
 
 ### 4. Deploy
@@ -165,6 +165,35 @@ speak(text: string, style?: string, raw_tags?: boolean)
 ```
 
 Existing `speak(text)` calls remain compatible.
+
+### Authenticated per-request voice options
+
+The original MCP `speak` tool and direct `/speak` requests without model options
+retain the configured default model and voice. A trusted server-side caller can
+override one direct `/speak` request without changing that default.
+
+Set a separate random secret of **at least 32 characters** on the Worker
+(`CATTEA_PWA_VOICE_OVERRIDE_TOKEN`) and on the trusted calling server. Do not
+embed it in browser JavaScript, URL query strings or this repository. Send it
+in the `X-CatTea-Voice-Token` HTTP header, including on `/status` requests.
+Only an authenticated status request reports `request_overrides` as available.
+
+Authenticated GET query options (or equivalent flat POST JSON fields) are
+`model_id` (`eleven_v3`, `eleven_v4`, `eleven_v4_turbo`), `language_code`
+(`en`, `zh`, `auto`), and optional `stability` and `similarity_boost` (0–1).
+Pass both sliders together. `auto` omits forced language. v4 uses Text to
+Dialogue with timestamps; v3 retains the existing Text to Speech route.
+Invalid or unauthorized overrides fail before synthesis, with no automatic
+fallback to another model. Provider access still depends on account eligibility.
+
+Run the no-credit mock tests before deployment:
+
+```bash
+npm ci
+npx wrangler deploy --dry-run --outdir .wrangler/voice-v4-test-bundle
+node --test tests/voice-overrides.test.mjs
+```
+
 
 When the MCP `speak` tool succeeds, the Worker stores the latest voice event for
 `/panel`. Keep `/panel` open while using `speak`; when a new voice arrives, the
