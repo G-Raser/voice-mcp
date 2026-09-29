@@ -35,6 +35,7 @@ export interface Env {
   ELEVENLABS_STYLE?: string;
   ELEVENLABS_USE_SPEAKER_BOOST?: string;
   ELEVENLABS_SPEED?: string;
+  CATTEA_PWA_VOICE_OVERRIDE_TOKEN?: string;
   AUDIO_URL_SIGNING_KEY?: string;
   BOT_NAME?: string;
   VOICE_HISTORY?: DurableObjectNamespace;
@@ -47,6 +48,9 @@ interface SpeakInput {
   text: string;
   style?: string;
   raw_tags?: boolean;
+  model_id?: ElevenLabsModelOverride;
+  language_code?: "auto" | "en" | "zh";
+  voice_settings?: ElevenLabsVoiceSettingsOverride;
 }
 
 interface AudioResult {
@@ -100,6 +104,54 @@ interface ElevenLabsHistoryItem {
   text?: string | null;
   alignments?: unknown;
   dialogue?: Array<Record<string, unknown>> | null;
+}
+
+type ElevenLabsModelOverride = "eleven_v3" | "eleven_v4" | "eleven_v4_turbo";
+type ElevenLabsVoiceSettingsOverride = { stability: number; similarity_boost: number };
+const ELEVENLABS_PWA_MODELS = new Set<ElevenLabsModelOverride>(["eleven_v3", "eleven_v4", "eleven_v4_turbo"]);
+
+function parseVoiceOverrides(raw: Record<string, unknown>): Pick<SpeakInput, "model_id" | "language_code" | "voice_settings"> {
+  const overrides: Pick<SpeakInput, "model_id" | "language_code" | "voice_settings"> = {};
+  if (Object.hasOwn(raw, "model_id")) {
+    if (typeof raw.model_id !== "string" || !ELEVENLABS_PWA_MODELS.has(raw.model_id as ElevenLabsModelOverride)) {
+      throw new Error("Unsupported CatTea voice model");
+    }
+    overrides.model_id = raw.model_id as ElevenLabsModelOverride;
+  }
+  if (Object.hasOwn(raw, "language_code")) {
+    if (raw.language_code !== "auto" && raw.language_code !== "en" && raw.language_code !== "zh") {
+      throw new Error("Unsupported voice language");
+    }
+    overrides.language_code = raw.language_code;
+  }
+  const stabilityPresent = Object.hasOwn(raw, "stability");
+  const similarityPresent = Object.hasOwn(raw, "similarity_boost");
+  if (stabilityPresent !== similarityPresent) {
+    throw new Error("Stability and similarity_boost must be supplied together");
+  }
+  if (stabilityPresent) {
+    function validSlider(value: unknown): number {
+      if ((typeof value !== "string" && typeof value !== "number") || String(value).trim() === "") {
+        throw new Error("Voice sliders must be numbers between 0 and 1");
+      }
+      const numberValue = Number(value);
+      if (!Number.isFinite(numberValue) || numberValue < 0 || numberValue > 1) {
+        throw new Error("Voice sliders must be numbers between 0 and 1");
+      }
+      return numberValue;
+    }
+    overrides.voice_settings = {
+      stability: validSlider(raw.stability),
+      similarity_boost: validSlider(raw.similarity_boost),
+    };
+  }
+  return overrides;
+}
+
+function pwaOverrideIsAuthorized(env: Env, request: Request): boolean {
+  const secret = env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN?.trim();
+  const provided = request.headers.get("X-CatTea-Voice-Token")?.trim() || "";
+  return Boolean(secret && secret.length >= 32 && provided && signaturesMatch(secret, provided));
 }
 
 // =============================================================================
@@ -2807,8 +2859,11 @@ function addElevenLabsTrailingPause(text: string, useV3Pacing = false): string {
 }
 
 function buildElevenLabsText(env: Env, input: SpeakInput): string {
-  const modelId = getElevenLabsModel(env);
+  const modelId = input.model_id || getElevenLabsModel(env);
 
+  if (modelId === "eleven_v4" || modelId === "eleven_v4_turbo") {
+    return input.raw_tags === false ? stripAudioTags(input.text) : input.text.trim();
+  }
   if (modelId !== "eleven_v3") {
     return addElevenLabsTrailingPause(stripAudioTags(input.text));
   }
@@ -2911,25 +2966,29 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
       return { success: false, error: "ELEVENLABS_VOICE_ID is not configured" };
     }
 
-    const modelId = getElevenLabsModel(env);
+    const modelId = input.model_id || getElevenLabsModel(env);
+    const isV4 = modelId === "eleven_v4" || modelId === "eleven_v4_turbo";
     const outputFormat = getElevenLabsOutputFormat(env);
     const finalText = buildElevenLabsText(env, input);
     const voiceSettings = getElevenLabsVoiceSettings(env);
     console.log("ElevenLabs TTS request", JSON.stringify({
       model_id: modelId,
-      text: finalText,
+      character_count: finalText.length,
     }));
 
-    const requestUrl = new URL(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`);
+    const requestUrl = new URL(isV4
+      ? "https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps"
+      : `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`);
     requestUrl.searchParams.set("output_format", outputFormat);
-    const requestBody: Record<string, unknown> = {
-      text: finalText,
-      model_id: modelId,
-      voice_settings: voiceSettings,
-    };
-
-    if (voiceSelection.languageCode) {
-      requestBody.language_code = voiceSelection.languageCode;
+    const requestBody: Record<string, unknown> = isV4
+      ? { inputs: [{ text: finalText, voice_id: voiceSelection.voiceId }], model_id: modelId }
+      : { text: finalText, model_id: modelId, voice_settings: { ...voiceSettings, ...input.voice_settings } };
+    if (isV4 && input.voice_settings) {
+      requestBody.settings = { ...input.voice_settings };
+    }
+    const languageCode = input.language_code === "auto" ? undefined : input.language_code || voiceSelection.languageCode;
+    if (languageCode) {
+      requestBody.language_code = languageCode;
     }
 
     const response = await fetch(requestUrl.toString(), {
@@ -3167,7 +3226,12 @@ function getTtsStatus(env: Env): Record<string, unknown> {
       configured: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID || env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN)),
       configured_zh: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID)),
       configured_en: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_EN || env.ELEVENLABS_VOICE_ID)),
-      audio_tags_enabled: modelId === "eleven_v3",
+      audio_tags_enabled: ["eleven_v3", "eleven_v4", "eleven_v4_turbo"].includes(modelId),
+      request_overrides: {
+        model_id: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN && env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN.trim().length >= 32),
+        language_code: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN && env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN.trim().length >= 32),
+        voice_settings: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN && env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN.trim().length >= 32),
+      },
       language_mode: env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN ? "auto" : "single",
       language_code: getElevenLabsLanguageCode(env) || "",
       language_codes: {
@@ -3293,7 +3357,7 @@ function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): Voi
     audio_base64: result.audio_base64 || "",
     created_at: new Date().toISOString(),
     provider,
-    model_id: provider === "elevenlabs" ? getElevenLabsModel(env) : getDashScopeModel(env),
+    model_id: provider === "elevenlabs" ? input.model_id || getElevenLabsModel(env) : getDashScopeModel(env),
     voice_id: voiceId,
     history_item_id: result.history_item_id,
     caption_cues: captionCues.length ? captionCues : undefined,
@@ -3799,10 +3863,16 @@ export default {
 
     // Status check
     if (path === '/status') {
+      const overrideAvailable = getTtsProvider(env) === 'elevenlabs' && pwaOverrideIsAuthorized(env, request);
       return Response.json({
         status: 'ok',
         service: 'voice-mcp',
         ...getTtsStatus(env),
+        request_overrides: {
+          model_id: overrideAvailable,
+          language_code: overrideAvailable,
+          voice_settings: overrideAvailable,
+        },
         version: '1.0.0',
       }, { headers: corsHeaders });
     }
@@ -3812,10 +3882,14 @@ export default {
       let textValue = "";
       let style: string | undefined;
       let rawTags: boolean | undefined;
+      const overrideValues: Record<string, unknown> = {};
       if (request.method === 'GET') {
         textValue = url.searchParams.get('text') || "";
         style = url.searchParams.get('style') || undefined;
         rawTags = parseRawTags(url.searchParams.get('raw_tags'));
+        for (const name of ['model_id', 'language_code', 'stability', 'similarity_boost']) {
+          if (url.searchParams.has(name)) overrideValues[name] = url.searchParams.get(name);
+        }
       } else {
         let body: unknown;
         try {
@@ -3836,6 +3910,22 @@ export default {
         textValue = typeof payload.text === 'string' ? payload.text : "";
         style = typeof payload.style === 'string' ? payload.style : undefined;
         rawTags = typeof payload.raw_tags === 'boolean' ? payload.raw_tags : undefined;
+        for (const name of ['model_id', 'language_code', 'stability', 'similarity_boost']) {
+          if (Object.hasOwn(payload, name)) overrideValues[name] = payload[name];
+        }
+      }
+      if (Object.keys(overrideValues).length && !pwaOverrideIsAuthorized(env, request)) {
+        return Response.json({ error: 'Authenticated CatTea PWA voice override required' }, {
+          status: 403, headers: corsHeaders,
+        });
+      }
+      let overrides: Pick<SpeakInput, 'model_id' | 'language_code' | 'voice_settings'>;
+      try {
+        overrides = parseVoiceOverrides(overrideValues);
+      } catch (error) {
+        return Response.json({ error: error instanceof Error ? error.message : 'Invalid voice override' }, {
+          status: 400, headers: corsHeaders,
+        });
       }
       const inputError = getSpeakInputError(textValue);
       if (inputError) {
@@ -3849,6 +3939,7 @@ export default {
         text: textValue,
         style,
         raw_tags: rawTags,
+        ...overrides,
       });
       const result = await generateAudio(env, input);
 
