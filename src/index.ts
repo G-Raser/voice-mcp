@@ -3647,6 +3647,12 @@ function parseSpeakOverrides(
   return { overrides };
 }
 
+function pwaOverrideIsAuthorized(env: Env, request: Request): boolean {
+  const secret = env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN?.trim() || '';
+  const token = request.headers.get('X-CatTea-Voice-Token') || '';
+  return getTtsProvider(env) === 'elevenlabs' && secret.length >= 32 && signaturesMatch(token, secret);
+}
+
 // =============================================================================
 // Worker Handler
 // =============================================================================
@@ -3870,10 +3876,16 @@ export default {
 
     // Status check
     if (path === '/status') {
+      const overrideAvailable = pwaOverrideIsAuthorized(env, request);
       return Response.json({
         status: 'ok',
         service: 'voice-mcp',
         ...getTtsStatus(env),
+        request_overrides: {
+          model_id: overrideAvailable,
+          language_code: overrideAvailable,
+          voice_settings: overrideAvailable,
+        },
         version: '1.0.0',
       }, { headers: corsHeaders });
     }
