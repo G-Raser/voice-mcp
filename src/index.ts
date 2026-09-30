@@ -44,6 +44,22 @@ export interface Env {
 type TtsProvider = "dashscope" | "elevenlabs";
 type ElevenLabsLanguage = "zh" | "en";
 
+type OfficialVoicePreferences = {
+  model_id: "eleven_v3" | "eleven_v4" | "eleven_v4_turbo";
+  language_code: "auto" | "en" | "zh";
+  settings_mode: "default" | "custom";
+  stability: number;
+  similarity_boost: number;
+};
+
+const DEFAULT_OFFICIAL_VOICE_PREFERENCES: OfficialVoicePreferences = {
+  model_id: "eleven_v3",
+  language_code: "en",
+  settings_mode: "default",
+  stability: 0.5,
+  similarity_boost: 0.75,
+};
+
 interface SpeakInput {
   text: string;
   style?: string;
@@ -3252,13 +3268,58 @@ function getAudioSigningSecret(env: Env): string {
   return env.AUDIO_URL_SIGNING_KEY || env.ELEVENLABS_API_KEY || env.DASHSCOPE_API_KEY || "";
 }
 
+
+async function readOfficialVoicePreferences(env: Env): Promise<OfficialVoicePreferences> {
+  if (!env.VOICE_HISTORY) return DEFAULT_OFFICIAL_VOICE_PREFERENCES;
+  try {
+    const id = env.VOICE_HISTORY.idFromName("cattea-voice-history-v1");
+    const stub = env.VOICE_HISTORY.get(id, { locationHint: "wnam" });
+    const response = await stub.fetch("https://voice-history.internal/preferences");
+    if (!response.ok) return DEFAULT_OFFICIAL_VOICE_PREFERENCES;
+    const data = await response.json<{ preferences?: Partial<OfficialVoicePreferences> }>();
+    const raw = data.preferences || {};
+    const model = ["eleven_v3", "eleven_v4", "eleven_v4_turbo"].includes(String(raw.model_id))
+      ? raw.model_id as OfficialVoicePreferences["model_id"]
+      : DEFAULT_OFFICIAL_VOICE_PREFERENCES.model_id;
+    const requestedLanguage = ["auto", "en", "zh"].includes(String(raw.language_code))
+      ? raw.language_code as OfficialVoicePreferences["language_code"]
+      : (model === "eleven_v3" ? "en" : "auto");
+    return {
+      model_id: model,
+      language_code: model === "eleven_v3" ? "en" : requestedLanguage,
+      settings_mode: raw.settings_mode === "custom" ? "custom" : "default",
+      stability: typeof raw.stability === "number" && Number.isFinite(raw.stability) ? raw.stability : 0.5,
+      similarity_boost: typeof raw.similarity_boost === "number" && Number.isFinite(raw.similarity_boost) ? raw.similarity_boost : 0.75,
+    };
+  } catch (error) {
+    console.error("Failed to read official CatTea voice preferences", error);
+    return DEFAULT_OFFICIAL_VOICE_PREFERENCES;
+  }
+}
+
+function applyOfficialVoicePreferences(input: SpeakInput, preferences: OfficialVoicePreferences): SpeakInput {
+  return {
+    ...input,
+    model_id: preferences.model_id,
+    language_code: preferences.language_code,
+    ...(preferences.settings_mode === "custom"
+      ? { stability: preferences.stability, similarity_boost: preferences.similarity_boost }
+      : {}),
+  };
+}
+
 function getAudioReplayPayload(expires: number, input: SpeakInput): string {
-  return JSON.stringify({
+  const payload: Record<string, unknown> = {
     expires,
     text: input.text,
     style: input.style || "",
     raw_tags: Boolean(input.raw_tags),
-  });
+  };
+  if (input.model_id) payload.model_id = input.model_id;
+  if (input.language_code) payload.language_code = input.language_code;
+  if (input.stability !== undefined) payload.stability = input.stability;
+  if (input.similarity_boost !== undefined) payload.similarity_boost = input.similarity_boost;
+  return JSON.stringify(payload);
 }
 
 function arrayBufferToBase64Url(value: ArrayBuffer): string {
@@ -3534,7 +3595,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
       inputSchema: z.object({
         text: z.string().describe("Text to speak"),
         style: z.string().optional().describe("Optional speaking style"),
-        raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3 audio tags when supported"),
+        raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs audio tags when supported"),
       }),
       _meta: {
         ui: { resourceUri: VOICE_RESOURCE_URI },
@@ -3543,7 +3604,11 @@ function createVoiceServer(env: Env, origin: string): McpServer {
       },
     },
     async ({ text, style, raw_tags }) => {
-      const input = normalizeSpeakInput({ text, style, raw_tags });
+      const preferences = await readOfficialVoicePreferences(env);
+      const input = applyOfficialVoicePreferences(
+        normalizeSpeakInput({ text, style, raw_tags }),
+        preferences,
+      );
       const inputError = getSpeakInputError(input.text);
       if (inputError) {
         return {
@@ -3789,10 +3854,14 @@ export default {
       try {
         const body = await request.json() as Partial<SpeakInput>;
         if (typeof body.text !== 'string') throw new Error('Missing text parameter');
+        const payload = body as Record<string, unknown>;
+        const parsed = parseSpeakOverrides(payload);
+        if (parsed.error) throw new Error(parsed.error);
         input = normalizeSpeakInput({
           text: body.text,
           style: typeof body.style === 'string' ? body.style : undefined,
           raw_tags: typeof body.raw_tags === 'boolean' ? body.raw_tags : undefined,
+          ...parsed.overrides,
         });
       } catch (error) {
         return Response.json({ error: error instanceof Error ? error.message : 'Invalid audio request' }, {

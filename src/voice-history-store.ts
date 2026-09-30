@@ -5,6 +5,48 @@ const RECENT_LIMIT = 12;
 const AUDIO_CHUNK_SIZE = 96_000;
 const FETCH_TIMEOUT_MS = 15_000;
 
+const OFFICIAL_VOICE_PREFERENCES_KEY = "official-voice-preferences-v1";
+
+export type OfficialVoicePreferences = {
+  model_id: "eleven_v3" | "eleven_v4" | "eleven_v4_turbo";
+  language_code: "auto" | "en" | "zh";
+  settings_mode: "default" | "custom";
+  stability: number;
+  similarity_boost: number;
+  updated_at?: string;
+};
+
+export const DEFAULT_OFFICIAL_VOICE_PREFERENCES: OfficialVoicePreferences = {
+  model_id: "eleven_v3",
+  language_code: "en",
+  settings_mode: "default",
+  stability: 0.5,
+  similarity_boost: 0.75,
+};
+
+function clamp01(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? Math.min(1, Math.max(0, parsed)) : fallback;
+}
+
+export function sanitizeOfficialVoicePreferences(value: unknown): OfficialVoicePreferences {
+  const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const model = ["eleven_v3", "eleven_v4", "eleven_v4_turbo"].includes(String(raw.model_id))
+    ? String(raw.model_id) as OfficialVoicePreferences["model_id"]
+    : DEFAULT_OFFICIAL_VOICE_PREFERENCES.model_id;
+  const requestedLanguage = ["auto", "en", "zh"].includes(String(raw.language_code))
+    ? String(raw.language_code) as OfficialVoicePreferences["language_code"]
+    : (model === "eleven_v3" ? "en" : "auto");
+  return {
+    model_id: model,
+    language_code: model === "eleven_v3" ? "en" : requestedLanguage,
+    settings_mode: raw.settings_mode === "custom" ? "custom" : "default",
+    stability: clamp01(raw.stability, DEFAULT_OFFICIAL_VOICE_PREFERENCES.stability),
+    similarity_boost: clamp01(raw.similarity_boost, DEFAULT_OFFICIAL_VOICE_PREFERENCES.similarity_boost),
+    ...(typeof raw.updated_at === "string" ? { updated_at: raw.updated_at } : {}),
+  };
+}
+
 export type GlobalVoiceEvent = {
   id: string;
   text: string;
@@ -257,6 +299,17 @@ export class VoiceHistoryStore {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/preferences" && request.method === "GET") {
+        const stored = await this.state.storage.get<OfficialVoicePreferences>(OFFICIAL_VOICE_PREFERENCES_KEY);
+        return Response.json({ preferences: sanitizeOfficialVoicePreferences(stored) });
+      }
+      if (url.pathname === "/preferences" && request.method === "PUT") {
+        const raw = await request.json<unknown>();
+        const preferences = sanitizeOfficialVoicePreferences(raw);
+        preferences.updated_at = new Date().toISOString();
+        await this.state.storage.put(OFFICIAL_VOICE_PREFERENCES_KEY, preferences);
+        return Response.json({ preferences });
+      }
       if (url.pathname === "/events" && request.method === "GET") {
         const events = await this.readIndex();
         return Response.json({ events: events.length ? events : await this.syncHistory() });
