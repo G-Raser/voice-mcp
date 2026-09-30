@@ -3192,11 +3192,6 @@ function getTtsStatus(env: Env): Record<string, unknown> {
       configured_zh: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID)),
       configured_en: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_EN || env.ELEVENLABS_VOICE_ID)),
       audio_tags_enabled: modelId === "eleven_v3" || isElevenV4(modelId),
-      request_overrides: {
-        model_id: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN),
-        language_code: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN),
-        voice_settings: Boolean(env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN),
-      },
       language_mode: env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN ? "auto" : "single",
       language_code: getElevenLabsLanguageCode(env) || "",
       language_codes: {
@@ -3887,7 +3882,7 @@ export default {
           voice_settings: overrideAvailable,
         },
         version: '1.0.0',
-      }, { headers: corsHeaders });
+      }, { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } });
     }
 
     // Direct audio API. POST avoids URL-length limits for long voice scripts.
@@ -3935,15 +3930,13 @@ export default {
 
       const hasOverrides = SPEAK_OVERRIDE_KEYS.some((key) => Object.prototype.hasOwnProperty.call(overrideFields, key));
       if (hasOverrides) {
-        const providedToken = request.headers.get('X-CatTea-Voice-Token') || '';
-        const expectedToken = env.CATTEA_PWA_VOICE_OVERRIDE_TOKEN || '';
-        if (!expectedToken || !signaturesMatch(providedToken, expectedToken)) {
+        if (getTtsProvider(env) !== 'elevenlabs') {
+          return Response.json({ error: 'Model overrides require ElevenLabs' }, { status: 400, headers: corsHeaders });
+        }
+        if (!pwaOverrideIsAuthorized(env, request)) {
           return Response.json({ error: 'Authenticated PWA voice override required' }, {
             status: 403, headers: { ...corsHeaders, 'Cache-Control': 'no-store' },
           });
-        }
-        if (getTtsProvider(env) !== 'elevenlabs') {
-          return Response.json({ error: 'Model overrides require ElevenLabs' }, { status: 400, headers: corsHeaders });
         }
       }
       const parsed = parseSpeakOverrides(overrideFields);
