@@ -2955,16 +2955,16 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
     const outputFormat = getElevenLabsOutputFormat(env);
     const finalText = buildElevenLabsText(env, input);
     const voiceSettings = getElevenLabsVoiceSettings(env, input, modelId);
-    // The v4 dialogue API uses inputs/settings, while the v3 endpoint uses text/voice_settings.
-    const requestUrl = new URL(isElevenV4(modelId)
-      ? "https://api.elevenlabs.io/v1/text-to-dialogue/with-timestamps"
-      : `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`);
+    // CatTea is a single-speaker cloned voice. Eleven v4 supports the normal
+    // Text-to-Speech endpoint directly; keep the clone voice ID in the path for
+    // maximum speaker identity consistency instead of routing through Dialogue.
+    const requestUrl = new URL(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`,
+    );
     requestUrl.searchParams.set("output_format", outputFormat);
-    const requestBody: Record<string, unknown> = isElevenV4(modelId)
-      ? { inputs: [{ text: finalText, voice_id: voiceSelection.voiceId }], model_id: modelId }
-      : { text: finalText, model_id: modelId, voice_settings: voiceSettings };
-    if (isElevenV4(modelId) && Object.keys(voiceSettings).length) {
-      requestBody.settings = voiceSettings;
+    const requestBody: Record<string, unknown> = { text: finalText, model_id: modelId };
+    if (Object.keys(voiceSettings).length) {
+      requestBody.voice_settings = voiceSettings;
     }
     if (voiceSelection.languageCode) {
       requestBody.language_code = voiceSelection.languageCode;
