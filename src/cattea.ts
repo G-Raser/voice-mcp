@@ -59,6 +59,55 @@ function getGlobalHistoryStub(env: Env): DurableObjectStub | null {
   return env.VOICE_HISTORY.get(id, { locationHint: "wnam" });
 }
 
+async function proxyOfficialVoicePreferences(request: Request, env: Env): Promise<Response> {
+  const stub = getGlobalHistoryStub(env);
+  if (!stub) {
+    return Response.json({ error: "Official voice settings store is unavailable" }, {
+      status: 503,
+      headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  if (request.method === "GET") {
+    const response = await stub.fetch("https://voice-history.internal/preferences");
+    return new Response(response.body, {
+      status: response.status,
+      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const originHeader = request.headers.get("Origin");
+  const fetchSite = request.headers.get("Sec-Fetch-Site");
+  const panelMarker = request.headers.get("X-CatTea-Panel");
+  if ((originHeader && originHeader !== url.origin) || (fetchSite && !["same-origin", "none"].includes(fetchSite)) || panelMarker !== "voice-settings-v1") {
+    return Response.json({ error: "Voice settings write must come from the CatTea Voice panel" }, {
+      status: 403,
+      headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch (_error) {
+    return Response.json({ error: "Invalid JSON body" }, {
+      status: 400,
+      headers: { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const response = await stub.fetch("https://voice-history.internal/preferences", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(raw),
+  });
+  return new Response(response.body, {
+    status: response.status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
 async function readGlobalRecentVoices(env: Env): Promise<GlobalHistoryResult> {
   const stub = getGlobalHistoryStub(env);
   if (!stub) return { events: [], ok: false, detail: "Global voice store is not configured" };
@@ -366,7 +415,8 @@ async function patchMcpResourceResponse(response: Response): Promise<Response> {
 function recentPanelAddon(): string {
   return `
 <style>
-  .cattea-history-trigger {
+  .cattea-history-trigger,
+  .cattea-voice-settings-trigger {
     min-height: 34px;
     border: 1px solid color-mix(in oklch, var(--line), transparent 8%);
     border-radius: 999px;
@@ -376,7 +426,8 @@ function recentPanelAddon(): string {
     font-size: 0.8rem;
     cursor: pointer;
   }
-  .cattea-history-trigger:hover, .cattea-history-trigger:focus-visible {
+  .cattea-history-trigger:hover, .cattea-history-trigger:focus-visible,
+  .cattea-voice-settings-trigger:hover, .cattea-voice-settings-trigger:focus-visible {
     color: var(--ice);
     border-color: color-mix(in oklch, var(--ice), var(--line) 34%);
     outline: none;
@@ -522,6 +573,143 @@ function recentPanelAddon(): string {
     color: var(--faint);
     font-size: 0.82rem;
   }
+  .cattea-voice-settings-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 24;
+    display: grid;
+    place-items: center;
+    padding: 18px;
+    background: rgba(0, 0, 0, 0.58);
+    backdrop-filter: blur(10px);
+  }
+  .cattea-voice-settings-backdrop[hidden] { display: none; }
+  .cattea-voice-settings-modal {
+    width: min(560px, 100%);
+    display: grid;
+    gap: 16px;
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 18px;
+    background: color-mix(in oklch, var(--panel-strong), black 8%);
+    box-shadow: 0 28px 90px rgba(0, 0, 0, 0.52);
+  }
+  .cattea-voice-settings-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+  }
+  .cattea-voice-settings-title {
+    display: grid;
+    gap: 4px;
+  }
+  .cattea-voice-settings-title strong {
+    font-size: 0.96rem;
+    letter-spacing: 0.01em;
+  }
+  .cattea-voice-settings-title span {
+    color: var(--faint);
+    font-size: 0.74rem;
+    line-height: 1.4;
+  }
+  .cattea-voice-settings-close {
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .cattea-voice-settings-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .cattea-voice-settings-field {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+  }
+  .cattea-voice-settings-field > span {
+    color: var(--muted);
+    font-size: 0.76rem;
+    font-weight: 680;
+  }
+  .cattea-voice-settings-field select {
+    width: 100%;
+    min-width: 0;
+    height: 40px;
+    border: 1px solid color-mix(in oklch, var(--line), transparent 8%);
+    border-radius: 12px;
+    background: oklch(0.08 0.012 220 / 0.82);
+    color: var(--ink);
+    padding: 0 10px;
+    outline: none;
+  }
+  .cattea-voice-settings-field select:focus {
+    border-color: var(--ice);
+    box-shadow: 0 0 0 3px oklch(0.72 0.08 196 / 0.16);
+  }
+  .cattea-voice-settings-sliders {
+    display: grid;
+    gap: 12px;
+    padding-top: 2px;
+  }
+  .cattea-voice-settings-sliders[hidden] { display: none; }
+  .cattea-voice-settings-slider {
+    display: grid;
+    gap: 6px;
+  }
+  .cattea-voice-settings-slider label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    color: var(--muted);
+    font-size: 0.76rem;
+  }
+  .cattea-voice-settings-slider output {
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .cattea-voice-settings-slider input[type="range"] {
+    width: 100%;
+    accent-color: var(--ice);
+  }
+  .cattea-voice-settings-status {
+    min-height: 20px;
+    color: var(--faint);
+    font-size: 0.76rem;
+    line-height: 1.4;
+  }
+  .cattea-voice-settings-status.error { color: #ff9b9b; }
+  .cattea-voice-settings-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .cattea-voice-settings-actions button {
+    min-height: 36px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 0 14px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .cattea-voice-settings-actions .primary {
+    border-color: color-mix(in oklch, var(--ice), var(--line) 24%);
+    background: color-mix(in oklch, var(--ice), transparent 82%);
+    color: var(--ink);
+  }
+  .cattea-voice-settings-actions button:disabled { cursor: wait; opacity: 0.6; }
+  @media (max-width: 520px) {
+    .cattea-voice-settings-grid { grid-template-columns: 1fr; }
+  }
 </style>
 <script>
 (() => {
@@ -537,6 +725,175 @@ function recentPanelAddon(): string {
   const receiverActions = receiver.querySelector('.receiver-actions');
   if (receiverActions) receiverActions.prepend(trigger);
   else receiver.appendChild(trigger);
+
+  const settingsTrigger = document.createElement('button');
+  settingsTrigger.id = 'catteaVoiceSettingsButton';
+  settingsTrigger.className = 'cattea-voice-settings-trigger';
+  settingsTrigger.type = 'button';
+  settingsTrigger.textContent = 'Voice';
+  if (receiverActions) receiverActions.prepend(settingsTrigger);
+  else receiver.appendChild(settingsTrigger);
+
+  const settingsBackdrop = document.createElement('div');
+  settingsBackdrop.className = 'cattea-voice-settings-backdrop';
+  settingsBackdrop.id = 'catteaVoiceSettingsBackdrop';
+  settingsBackdrop.hidden = true;
+  settingsBackdrop.innerHTML = \`
+    <section class="cattea-voice-settings-modal" role="dialog" aria-modal="true" aria-labelledby="catteaVoiceSettingsTitle">
+      <div class="cattea-voice-settings-head">
+        <div class="cattea-voice-settings-title">
+          <strong id="catteaVoiceSettingsTitle">CatTea Voice</strong>
+          <span>Official ChatGPT voice only · PWA preferences stay independent.</span>
+        </div>
+        <button class="cattea-voice-settings-close" id="catteaVoiceSettingsClose" type="button" aria-label="Close voice settings">×</button>
+      </div>
+      <div class="cattea-voice-settings-grid">
+        <label class="cattea-voice-settings-field">
+          <span>Model</span>
+          <select id="catteaVoiceModel">
+            <option value="eleven_v3">Eleven v3</option>
+            <option value="eleven_v4">Eleven v4</option>
+            <option value="eleven_v4_turbo">Eleven v4 Turbo</option>
+          </select>
+        </label>
+        <label class="cattea-voice-settings-field">
+          <span>Language</span>
+          <select id="catteaVoiceLanguage">
+            <option value="auto">Auto</option>
+            <option value="en">English</option>
+            <option value="zh">中文</option>
+          </select>
+        </label>
+        <label class="cattea-voice-settings-field">
+          <span>Voice parameters</span>
+          <select id="catteaVoiceSettingsMode">
+            <option value="default">Model defaults</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+      </div>
+      <div class="cattea-voice-settings-sliders" id="catteaVoiceSettingsSliders" hidden>
+        <div class="cattea-voice-settings-slider">
+          <label for="catteaVoiceStability">Stability <output id="catteaVoiceStabilityValue">0.50</output></label>
+          <input id="catteaVoiceStability" type="range" min="0" max="1" step="0.01" value="0.50">
+        </div>
+        <div class="cattea-voice-settings-slider">
+          <label for="catteaVoiceSimilarity">Similarity <output id="catteaVoiceSimilarityValue">0.75</output></label>
+          <input id="catteaVoiceSimilarity" type="range" min="0" max="1" step="0.01" value="0.75">
+        </div>
+      </div>
+      <div class="cattea-voice-settings-status" id="catteaVoiceSettingsStatus"></div>
+      <div class="cattea-voice-settings-actions">
+        <button id="catteaVoiceSettingsCancel" type="button">Cancel</button>
+        <button class="primary" id="catteaVoiceSettingsSave" type="button">Save</button>
+      </div>
+    </section>
+  \`;
+  document.body.appendChild(settingsBackdrop);
+
+  const settingsModal = settingsBackdrop.querySelector('.cattea-voice-settings-modal');
+  const settingsClose = document.getElementById('catteaVoiceSettingsClose');
+  const settingsCancel = document.getElementById('catteaVoiceSettingsCancel');
+  const settingsSave = document.getElementById('catteaVoiceSettingsSave');
+  const settingsModel = document.getElementById('catteaVoiceModel');
+  const settingsLanguage = document.getElementById('catteaVoiceLanguage');
+  const settingsMode = document.getElementById('catteaVoiceSettingsMode');
+  const settingsSliders = document.getElementById('catteaVoiceSettingsSliders');
+  const settingsStability = document.getElementById('catteaVoiceStability');
+  const settingsSimilarity = document.getElementById('catteaVoiceSimilarity');
+  const settingsStabilityValue = document.getElementById('catteaVoiceStabilityValue');
+  const settingsSimilarityValue = document.getElementById('catteaVoiceSimilarityValue');
+  const settingsStatus = document.getElementById('catteaVoiceSettingsStatus');
+
+  function closeVoiceSettings() {
+    settingsBackdrop.hidden = true;
+  }
+
+  function setVoiceSettingsStatus(message, error = false) {
+    settingsStatus.textContent = message || '';
+    settingsStatus.classList.toggle('error', Boolean(error));
+  }
+
+  function syncVoiceSettingsControls() {
+    if (settingsModel.value === 'eleven_v3') {
+      settingsLanguage.value = 'en';
+      settingsLanguage.disabled = true;
+    } else {
+      settingsLanguage.disabled = false;
+    }
+    settingsSliders.hidden = settingsMode.value !== 'custom';
+    settingsStabilityValue.value = Number(settingsStability.value).toFixed(2);
+    settingsSimilarityValue.value = Number(settingsSimilarity.value).toFixed(2);
+  }
+
+  function applyVoicePreferences(preferences) {
+    settingsModel.value = preferences?.model_id || 'eleven_v3';
+    settingsLanguage.value = preferences?.language_code || (settingsModel.value === 'eleven_v3' ? 'en' : 'auto');
+    settingsMode.value = preferences?.settings_mode === 'custom' ? 'custom' : 'default';
+    settingsStability.value = String(Number.isFinite(Number(preferences?.stability)) ? Number(preferences.stability) : 0.5);
+    settingsSimilarity.value = String(Number.isFinite(Number(preferences?.similarity_boost)) ? Number(preferences.similarity_boost) : 0.75);
+    syncVoiceSettingsControls();
+  }
+
+  async function loadVoicePreferences() {
+    setVoiceSettingsStatus('Loading…');
+    try {
+      const response = await fetch('/settings/voice?_=' + Date.now(), { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Voice settings unavailable');
+      applyVoicePreferences(data.preferences || {});
+      setVoiceSettingsStatus('Saved separately for official ChatGPT voice.');
+    } catch (error) {
+      setVoiceSettingsStatus(error instanceof Error ? error.message : String(error), true);
+    }
+  }
+
+  async function saveVoicePreferences() {
+    settingsSave.disabled = true;
+    setVoiceSettingsStatus('Saving…');
+    const payload = {
+      model_id: settingsModel.value,
+      language_code: settingsModel.value === 'eleven_v3' ? 'en' : settingsLanguage.value,
+      settings_mode: settingsMode.value,
+      stability: Number(settingsStability.value),
+      similarity_boost: Number(settingsSimilarity.value),
+    };
+    try {
+      const response = await fetch('/settings/voice', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-CatTea-Panel': 'voice-settings-v1' },
+        body: JSON.stringify(payload),
+        cache: 'no-store',
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Voice settings save failed');
+      applyVoicePreferences(data.preferences || payload);
+      setVoiceSettingsStatus('Saved. New official CatTea Voice clips will use this model.');
+      setTimeout(closeVoiceSettings, 650);
+    } catch (error) {
+      setVoiceSettingsStatus(error instanceof Error ? error.message : String(error), true);
+    } finally {
+      settingsSave.disabled = false;
+    }
+  }
+
+  settingsTrigger.addEventListener('click', async (event) => {
+    event.stopPropagation();
+    settingsBackdrop.hidden = false;
+    await loadVoicePreferences();
+    settingsModel.focus();
+  });
+  settingsClose.addEventListener('click', closeVoiceSettings);
+  settingsCancel.addEventListener('click', closeVoiceSettings);
+  settingsSave.addEventListener('click', saveVoicePreferences);
+  settingsModel.addEventListener('change', syncVoiceSettingsControls);
+  settingsLanguage.addEventListener('change', syncVoiceSettingsControls);
+  settingsMode.addEventListener('change', syncVoiceSettingsControls);
+  settingsStability.addEventListener('input', syncVoiceSettingsControls);
+  settingsSimilarity.addEventListener('input', syncVoiceSettingsControls);
+  settingsModal.addEventListener('click', (event) => event.stopPropagation());
+  settingsBackdrop.addEventListener('click', closeVoiceSettings);
 
   const backdrop = document.createElement('div');
   backdrop.className = 'cattea-history-backdrop';
@@ -921,6 +1278,10 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const origin = url.origin;
+
+    if (path === "/settings/voice" && (request.method === "GET" || request.method === "PUT")) {
+      return proxyOfficialVoicePreferences(request, env);
+    }
 
     if (path === "/events/recent" && request.method === "GET") {
       return handleRecentEvents(request, origin, env, ctx);
