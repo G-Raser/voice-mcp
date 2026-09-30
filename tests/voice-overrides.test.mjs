@@ -7,7 +7,7 @@ const TOKEN = "cattea-pwa-voice-test-token-32-characters-minimum";
 const BUNDLE = resolve(process.env.VOICE_WORKER_BUNDLE || ".wrangler/voice-v4-test-bundle/cattea-glass.js");
 const fakeAudio = Buffer.from("ID3mock-audio", "utf8").toString("base64");
 
-function createWorker(authorized = true) {
+function createWorker(authorized = true, token = TOKEN) {
   const outbound = [];
   const bindings = {
     TTS_PROVIDER: "elevenlabs",
@@ -19,7 +19,7 @@ function createWorker(authorized = true) {
     ELEVENLABS_STYLE: "0.82",
     ELEVENLABS_SPEED: "1.14",
     ELEVENLABS_API_KEY: "ElevenLabs-test-key-never-used",
-    ...(authorized ? { CATTEA_PWA_VOICE_OVERRIDE_TOKEN: TOKEN } : {}),
+    ...(authorized ? { CATTEA_PWA_VOICE_OVERRIDE_TOKEN: token } : {}),
   };
   const mf = new Miniflare({
     modules: true,
@@ -60,6 +60,18 @@ test("read-only status advertises overrides only when private secret exists", as
     assert.equal(disabled.request_overrides.model_id, false);
     assert.equal(a.outbound.length + b.outbound.length, 0);
   } finally { await a.mf.dispose(); await b.mf.dispose(); }
+});
+
+test("short secrets never advertise or authorize model overrides", async () => {
+  const shortSecret = "too-short";
+  const { mf, outbound } = createWorker(true, shortSecret);
+  try {
+    const status = await (await mf.dispatchFetch("https://voice.local/status", { headers: { "X-CatTea-Voice-Token": shortSecret } })).json();
+    assert.equal(status.request_overrides.model_id, false);
+    const base = { text: "Hello Crown.", model_id: "eleven_v4", language_code: "en" };
+    assert.equal((await mf.dispatchFetch(speech(base, shortSecret))).status, 403);
+    assert.equal(outbound.length, 0);
+  } finally { await mf.dispose(); }
 });
 
 test("unauthorized and malformed overrides never reach paid upstream", async () => {
@@ -108,6 +120,21 @@ test("authenticated v4 Chinese forwards tags, voice and only supported controls"
     assert.ok(!("voice_settings" in outbound[0].body));
     assert.ok(!("style" in outbound[0].body.settings));
     assert.ok(!("speed" in outbound[0].body.settings));
+  } finally { await mf.dispose(); }
+});
+
+test("authenticated POST v4 request uses dialogue endpoint without putting speech in the URL", async () => {
+  const { mf, outbound } = createWorker();
+  try {
+    const res = await mf.dispatchFetch("https://voice.local/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CatTea-Voice-Token": TOKEN },
+      body: JSON.stringify({ text: "主人，过来一点。", model_id: "eleven_v4", language_code: "zh" }),
+    });
+    assert.equal(res.status, 200, await res.clone().text());
+    assert.equal(outbound.length, 1);
+    assert.match(outbound[0].url, /\/v1\/text-to-dialogue\/with-timestamps/);
+    assert.deepEqual(outbound[0].body.inputs, [{ text: "主人，过来一点。", voice_id: "voice-clone-test" }]);
   } finally { await mf.dispose(); }
 });
 
