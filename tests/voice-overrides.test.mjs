@@ -112,18 +112,18 @@ test("authenticated v4 Chinese forwards tags, voice and only supported controls"
     }, TOKEN));
     assert.equal(res.status, 200, await res.clone().text());
     assert.equal(outbound.length, 1);
-    assert.match(outbound[0].url, /\/v1\/text-to-dialogue\/with-timestamps/);
+    assert.match(outbound[0].url, /\/v1\/text-to-speech\/voice-clone-test\/with-timestamps/);
     assert.equal(outbound[0].body.model_id, "eleven_v4");
-    assert.deepEqual(outbound[0].body.inputs, [{ text: "[whispers] 主人，过来一点。", voice_id: "voice-clone-test" }]);
+    assert.equal(outbound[0].body.text, "[whispers] 主人，过来一点。");
     assert.equal(outbound[0].body.language_code, "zh");
-    assert.deepEqual(outbound[0].body.settings, { stability: 0.41, similarity_boost: 0.88 });
-    assert.ok(!("voice_settings" in outbound[0].body));
-    assert.ok(!("style" in outbound[0].body.settings));
-    assert.ok(!("speed" in outbound[0].body.settings));
+    assert.deepEqual(outbound[0].body.voice_settings, { stability: 0.41, similarity_boost: 0.88 });
+    assert.ok(!("inputs" in outbound[0].body));
+    assert.ok(!("style" in outbound[0].body.voice_settings));
+    assert.ok(!("speed" in outbound[0].body.voice_settings));
   } finally { await mf.dispose(); }
 });
 
-test("authenticated POST v4 request uses dialogue endpoint without putting speech in the URL", async () => {
+test("authenticated POST v4 request uses clone-bound TTS endpoint without putting speech text in the URL", async () => {
   const { mf, outbound } = createWorker();
   try {
     const res = await mf.dispatchFetch("https://voice.local/speak", {
@@ -133,8 +133,9 @@ test("authenticated POST v4 request uses dialogue endpoint without putting speec
     });
     assert.equal(res.status, 200, await res.clone().text());
     assert.equal(outbound.length, 1);
-    assert.match(outbound[0].url, /\/v1\/text-to-dialogue\/with-timestamps/);
-    assert.deepEqual(outbound[0].body.inputs, [{ text: "主人，过来一点。", voice_id: "voice-clone-test" }]);
+    assert.match(outbound[0].url, /\/v1\/text-to-speech\/voice-clone-test\/with-timestamps/);
+    assert.equal(outbound[0].body.text, "主人，过来一点。");
+    assert.ok(!("inputs" in outbound[0].body));
   } finally { await mf.dispose(); }
 });
 
@@ -145,10 +146,10 @@ test("v4 auto omits forced language and v4 Turbo receives selected model", async
     assert.equal(v4.status, 200);
     assert.equal(outbound[0].body.model_id, "eleven_v4");
     assert.ok(!("language_code" in outbound[0].body));
-    assert.ok(!("settings" in outbound[0].body));
+    assert.ok(!("voice_settings" in outbound[0].body));
     const turbo = await mf.dispatchFetch(speech({ text: "Hello Crown.", model_id: "eleven_v4_turbo", language_code: "en" }, TOKEN));
     assert.equal(turbo.status, 200);
     assert.equal(outbound[1].body.model_id, "eleven_v4_turbo");
-    assert.match(outbound[1].url, /text-to-dialogue\/with-timestamps/);
+    assert.match(outbound[1].url, /\/v1\/text-to-speech\/voice-clone-test\/with-timestamps/);
   } finally { await mf.dispose(); }
 });
