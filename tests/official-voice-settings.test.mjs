@@ -136,10 +136,10 @@ test("official MCP speak reads panel preference while direct PWA route remains i
     });
     assert.equal(result.structuredContent?.model_id, "eleven_v4");
     assert.equal(outbound.length, 1);
-    assert.match(outbound[0].url, /\/v1\/text-to-dialogue\/with-timestamps/);
+    assert.match(outbound[0].url, /\/v1\/text-to-speech\/voice-clone-test\/with-timestamps/);
     assert.equal(outbound[0].body.model_id, "eleven_v4");
     assert.equal(outbound[0].body.language_code, "zh");
-    assert.deepEqual(outbound[0].body.settings, { stability: 0.41, similarity_boost: 0.88 });
+    assert.deepEqual(outbound[0].body.voice_settings, { stability: 0.41, similarity_boost: 0.88 });
 
     const direct = await mf.dispatchFetch("https://voice.local/speak?text=Hello%20Crown.");
     assert.equal(direct.status, 200, await direct.clone().text());
